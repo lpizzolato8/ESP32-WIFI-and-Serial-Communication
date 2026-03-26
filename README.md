@@ -255,13 +255,3 @@ seq=    1  pos=(1.000, 2.000, 3.000)  quat=(1.000, 0.000, 0.000, 0.000)
 | UART_TX_PIN       | 17         | GPIO to STM32 RX        |
 | UART_RX_PIN       | 18         | GPIO from STM32 TX      |
 
----
-
-## Next steps
-
-- STM32 integration — include pose_frame.h on the STM32 and parse frames
-  by scanning for 0xABCD magic bytes on the UART RX interrupt
-- Bidirectional comms — add a second UDP socket that transmits data from
-  the STM32 back to the laptop
-- Send real pose data — replace the dummy values in test_bridge.py with
-  your actual sensor output
