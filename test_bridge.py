@@ -10,7 +10,7 @@ Usage:
 Dependencies:
     pip install pyserial
 """
-
+from pose_frame import PoseFrame
 import argparse
 import socket
 import struct
@@ -33,12 +33,9 @@ SEND_DELAY_S = 0.01    # 10 ms between frames → ~100 Hz
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def make_frame(seq: int) -> bytes:
-    """Build a dummy pose frame. Swap in your real data here."""
-    px, py, pz   = seq * 0.001, seq * 0.002, seq * 0.003   # position
-    qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0                   # identity quaternion
-    return struct.pack(FRAME_FORMAT, px, py, pz, qw, qx, qy, qz)
-
+raw = PoseFrame.pack(seq=0, pos_x=1.0, pos_y=2.0, pos_z=3.0,
+                     quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
+sock.sendto(raw, ("192.168.4.1", 4444))
 
 def parse_frame(data: bytes):
     if len(data) < FRAME_SIZE:

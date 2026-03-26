@@ -68,6 +68,8 @@ static void uart_init(void)
 
 static void bridge_task(void *arg)
 {
+    
+    ESP_LOGI(TAG, "bridge_task started");
     /* ── Open UDP socket ────────────────────────────────────────────────── */
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
@@ -101,8 +103,10 @@ static void bridge_task(void *arg)
         int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0,
                            (struct sockaddr *)&src, &src_len);
 
+        ESP_LOGI(TAG, "recvfrom returned %d", len);
+
         if (len < 0) {
-            ESP_LOGW(TAG, "recvfrom() error: errno %d", errno);
+ 	    ESP_LOGW(TAG, "recvfrom() error: errno %d", errno);
             continue;
         }
         if (len == 0) {
@@ -117,12 +121,12 @@ static void bridge_task(void *arg)
             ESP_LOGW(TAG, "UART TX short write: wanted %d got %d", len, written);
         }
 
-        /* Optional: uncomment for verbose per-packet logging.
-         * Leave commented in production to avoid log overhead.
+        
+         
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
         ESP_LOGD(TAG, "[%s] %d bytes → UART", src_ip, len);
-        */
+        
     }
 
     close(sock);

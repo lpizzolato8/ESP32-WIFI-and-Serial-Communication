@@ -1,7 +1,4 @@
-
-cmake_minimum_required(VERSION 3.10)
-project(MyProject)
-
-set(CMAKE_CXX_STANDARD 17)
-
-add_executable(my_executable main.cp)
+cmake_minimum_required(VERSION 3.16)
+set(IDF_TARGET "esp32s3")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(esp32s3_hotspot)
