@@ -113,8 +113,14 @@ static void bridge_task(void *arg)
             continue;
         }
 
+        /* Send a 1-byte UDP ack back to the sender *before* writing to UART.
+         * The laptop timestamps this to split WiFi latency from UART latency. */
+        uint8_t ack = 0xAC;
+        sendto(sock, &ack, 1, 0, (struct sockaddr *)&src, src_len);
+
         /* Write raw bytes to UART – non-blocking from caller's perspective
          * because the UART driver has its own TX ring buffer.              */
+
         int written = uart_write_bytes(UART_PORT_NUM, rx_buf, len);
 
         if (written != len) {

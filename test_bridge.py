@@ -2,7 +2,16 @@
 """
 test_bridge.py  –  Send binary frames over UDP to the ESP32 bridge,
                    read them back from the local serial port, and
-                   measure round-trip latency.
+                   measure latency in two legs:
+
+   Leg 1 (WiFi RTT)  : laptop sendto() → ESP32 recvfrom() → ack back
+                        measured as (t_ack - t_send)
+   Leg 2 (UART leg)  : ESP32 writes UART → laptop reads serial
+                        measured as (t_serial - t_ack)
+   Total             : (t_serial - t_send)
+
+   Note: the ESP32 sends the ack *before* uart_write_bytes(), so the ack
+   always arrives before serial data — sequential waiting is safe.
 
 Usage:
     python3 test_bridge.py --port /dev/ttyUSB0 --baud 115200
@@ -10,37 +19,29 @@ Usage:
 Dependencies:
     pip install pyserial
 """
-from pose_frame import PoseFrame
+from pose_frame import PoseFrame, FRAME_SIZE
 import argparse
 import socket
-import struct
 import serial
 import time
 import sys
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-ESP_IP      = "192.168.4.1"
+ESP_IP       = "192.168.4.1"
 ESP_UDP_PORT = 4444
-
-# Dummy frame: 3× position floats + 4× quaternion floats = 28 bytes
-# Replace this struct with your actual frame definition.
-FRAME_FORMAT = "<7f"   # little-endian, 7 floats
-FRAME_SIZE   = struct.calcsize(FRAME_FORMAT)   # 28 bytes
 
 SEND_COUNT   = 100     # frames to send per run
 SEND_DELAY_S = 0.01    # 10 ms between frames → ~100 Hz
 
+ACK_BYTE     = 0xAC    # must match udp_uart_bridge.c
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-raw = PoseFrame.pack(seq=0, pos_x=1.0, pos_y=2.0, pos_z=3.0,
-                     quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
-sock.sendto(raw, ("192.168.4.1", 4444))
-
-def parse_frame(data: bytes):
-    if len(data) < FRAME_SIZE:
-        return None
-    return struct.unpack(FRAME_FORMAT, data[:FRAME_SIZE])
+def make_frame(seq: int) -> bytes:
+    return PoseFrame.pack(seq=seq,
+                          pos_x=1.0, pos_y=2.0, pos_z=3.0,
+                          quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -62,50 +63,93 @@ def main():
 
     # Open UDP socket
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.settimeout(0.5)
     print(f"[udp]    sending to {ESP_IP}:{ESP_UDP_PORT}")
-    print(f"[frame]  format={FRAME_FORMAT}  size={FRAME_SIZE} bytes")
+    print(f"[frame]  size={FRAME_SIZE} bytes")
     print(f"[run]    sending {args.count} frames at ~{1/SEND_DELAY_S:.0f} Hz\n")
 
-    latencies = []
+    latencies   = []   # total
+    wifi_rtts   = []
+    uart_legs   = []
 
     for seq in range(args.count):
         frame = make_frame(seq)
 
+        # ── Send ────────────────────────────────────────────────────────
         t_send = time.perf_counter()
         udp.sendto(frame, (ESP_IP, ESP_UDP_PORT))
 
-        # Read back from serial
+        # ── Wait for UDP ack (Leg 1: WiFi round-trip) ────────────────────
+        t_ack = None
+        udp.settimeout(0.2)
+        try:
+            ack_data, _ = udp.recvfrom(16)
+            if len(ack_data) >= 1 and ack_data[0] == ACK_BYTE:
+                t_ack = time.perf_counter()
+        except socket.timeout:
+            pass
+
+        # ── Wait for serial data (Leg 2: UART to laptop) ─────────────────
         received = b""
         deadline = time.perf_counter() + 0.5  # 500 ms timeout per frame
         while len(received) < FRAME_SIZE and time.perf_counter() < deadline:
             chunk = ser.read(FRAME_SIZE - len(received))
             received += chunk
 
-        t_recv = time.perf_counter()
+        t_serial = time.perf_counter()
 
-        if len(received) >= FRAME_SIZE:
-            latency_ms = (t_recv - t_send) * 1000
-            latencies.append(latency_ms)
-            parsed = parse_frame(received)
-            print(f"  frame {seq:>4}  {latency_ms:6.2f} ms  pos=({parsed[0]:.4f}, {parsed[1]:.4f}, {parsed[2]:.4f})")
+        # ── Report ───────────────────────────────────────────────────────
+        byte_count = len(received)
+        hex_dump   = received.hex(' ') if received else '(none)'
+
+        print(f"\n  [frame {seq}]  bytes received: {byte_count}/{FRAME_SIZE}")
+        print(f"  hex: {hex_dump}")
+
+        if byte_count >= FRAME_SIZE:
+            total_ms = (t_serial - t_send) * 1000
+            latencies.append(total_ms)
+
+            try:
+                parsed   = PoseFrame.unpack(received)
+                crc_ok   = True
+                pos_str  = f"pos=({parsed['pos'][0]:.3f}, {parsed['pos'][1]:.3f}, {parsed['pos'][2]:.3f})"
+                quat_str = f"quat=({parsed['quat'][0]:.3f}, {parsed['quat'][1]:.3f}, {parsed['quat'][2]:.3f}, {parsed['quat'][3]:.3f})"
+            except ValueError as e:
+                crc_ok   = False
+                pos_str  = f"({e})"
+                quat_str = ""
+
+            crc_tag = "CRC OK" if crc_ok else "CRC FAIL"
+            print(f"  {crc_tag}  {pos_str}  {quat_str}")
+
+            if t_ack is not None:
+                wifi_ms = (t_ack    - t_send)  * 1000
+                uart_ms = (t_serial - t_ack)   * 1000
+                wifi_rtts.append(wifi_ms)
+                uart_legs.append(uart_ms)
+                print(f"  total={total_ms:.2f}ms  wifi_rtt={wifi_ms:.2f}ms  uart_leg={uart_ms:.2f}ms")
+            else:
+                print(f"  total={total_ms:.2f}ms  (no ack received)")
         else:
-            print(f"  frame {seq:>4}  TIMEOUT (got {len(received)}/{FRAME_SIZE} bytes)")
+            print(f"  TIMEOUT")
 
         time.sleep(SEND_DELAY_S)
 
     # ── Summary ──────────────────────────────────────────────────────────
+    print(f"\n── Results {'─'*36}")
+    print(f"  frames sent     : {args.count}")
+    print(f"  frames received : {len(latencies)}")
+    print(f"  packet loss     : {args.count - len(latencies)}")
+
     if latencies:
-        avg = sum(latencies) / len(latencies)
-        mn  = min(latencies)
-        mx  = max(latencies)
-        print(f"\n── Results ──────────────────────────────────")
-        print(f"  frames sent   : {args.count}")
-        print(f"  frames received: {len(latencies)}")
-        print(f"  loss          : {args.count - len(latencies)}")
-        print(f"  latency avg   : {avg:.2f} ms")
-        print(f"  latency min   : {mn:.2f} ms")
-        print(f"  latency max   : {mx:.2f} ms")
+        def stats(label, data):
+            if not data:
+                return
+            avg = sum(data) / len(data)
+            print(f"  {label:<16}: avg={avg:6.2f}ms  min={min(data):6.2f}ms  max={max(data):6.2f}ms")
+
+        stats("total latency",  latencies)
+        stats("WiFi RTT",       wifi_rtts)
+        stats("UART leg",       uart_legs)
 
     udp.close()
     ser.close()
