@@ -27,10 +27,10 @@
 
 #define BRIDGE_UDP_PORT  4444
 
-#define UART_PORT_NUM    UART_NUM_1
-#define UART_BAUD_RATE   115200   /* Match STM32 UART config                */
-#define UART_TX_PIN      17       /* GPIO → STM32 RX                        */
-#define UART_RX_PIN      18       /* GPIO ← STM32 TX (wired, not used here) */
+#define UART_PORT_NUM    UART_NUM_0
+#define UART_BAUD_RATE   921600
+#define UART_TX_PIN      43       /* UART0 TX – routed to onboard USB-serial */
+#define UART_RX_PIN      44       /* UART0 RX – routed to onboard USB-serial */
 #define UART_BUF_SIZE    1024     /* Must be > largest expected UDP payload  */
 
 #define TASK_STACK       4096

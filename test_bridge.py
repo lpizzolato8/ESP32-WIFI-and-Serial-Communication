@@ -2,19 +2,10 @@
 """
 test_bridge.py  –  Send binary frames over UDP to the ESP32 bridge,
                    read them back from the local serial port, and
-                   measure latency in two legs:
-
-   Leg 1 (WiFi RTT)  : laptop sendto() → ESP32 recvfrom() → ack back
-                        measured as (t_ack - t_send)
-   Leg 2 (UART leg)  : ESP32 writes UART → laptop reads serial
-                        measured as (t_serial - t_ack)
-   Total             : (t_serial - t_send)
-
-   Note: the ESP32 sends the ack *before* uart_write_bytes(), so the ack
-   always arrives before serial data — sequential waiting is safe.
+                   report packet loss and latency.
 
 Usage:
-    python3 test_bridge.py --port /dev/ttyUSB0 --baud 115200
+    python3 test_bridge.py --port /dev/ttyUSB0 --baud 921600 --hz 300
 
 Dependencies:
     pip install pyserial
@@ -24,6 +15,8 @@ import argparse
 import socket
 import serial
 import time
+import struct
+import threading
 import sys
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -31,10 +24,15 @@ import sys
 ESP_IP       = "192.168.4.1"
 ESP_UDP_PORT = 4444
 
-SEND_COUNT   = 100     # frames to send per run
-SEND_DELAY_S = 0.01    # 10 ms between frames → ~100 Hz
+SEND_COUNT   = 300     # frames to send per run
+HZ           = 300     # target send rate
 
-ACK_BYTE     = 0xAC    # must match udp_uart_bridge.c
+MAGIC        = 0xABCD
+MAGIC_BYTES  = struct.pack("<H", MAGIC)
+
+# ESP32 forwards the payload only (no CRC appended)
+SERIAL_FMT   = "<HH7f"
+SERIAL_SIZE  = struct.calcsize(SERIAL_FMT)  # 32 bytes
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +42,35 @@ def make_frame(seq: int) -> bytes:
                           quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
 
 
+# ── Receiver thread ──────────────────────────────────────────────────────────
+
+def serial_receiver(ser, received_seqs: dict, send_times: dict, stop_event: threading.Event):
+    """Reads frames from serial, records arrival time keyed by seq number."""
+    buf = b""
+    raw_bytes = 0
+    while not stop_event.is_set():
+        chunk = ser.read(max(1, ser.in_waiting))
+        if chunk:
+            buf += chunk
+            raw_bytes += len(chunk)
+        while len(buf) >= SERIAL_SIZE:
+            if buf[:2] != MAGIC_BYTES:
+                buf = buf[1:]
+                continue
+            try:
+                magic, seq, px, py, pz, qw, qx, qy, qz = struct.unpack_from(SERIAL_FMT, buf)
+                t_recv = time.perf_counter()
+                received_seqs[seq] = t_recv
+                if seq in send_times:
+                    latency_ms = (t_recv - send_times[seq]) * 1000
+                    print(f"  seq={seq:>5}  latency={latency_ms:.2f}ms  "
+                          f"pos=({px:.3f}, {py:.3f}, {pz:.3f})")
+            except struct.error:
+                pass
+            buf = buf[SERIAL_SIZE:]
+    print(f"[serial] raw bytes received: {raw_bytes}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -51,105 +78,70 @@ def main():
     parser.add_argument("--port",  default="/dev/ttyUSB0", help="Serial port")
     parser.add_argument("--baud",  default=115200, type=int, help="Baud rate")
     parser.add_argument("--count", default=SEND_COUNT, type=int, help="Frames to send")
+    parser.add_argument("--hz",    default=HZ, type=float, help="Send rate in Hz")
     args = parser.parse_args()
 
-    # Open serial port (your laptop end, reading what the ESP32 forwarded)
+    send_delay = 1.0 / args.hz
+
+    max_hz = (args.baud / 10) / FRAME_SIZE
+    if args.hz > max_hz * 0.8:
+        print(f"[warn]   {args.hz:.0f} Hz exceeds 80% of UART capacity "
+              f"({max_hz:.0f} Hz max at {args.baud} baud) — expect drops")
+
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=0.1)
+        ser = serial.Serial(args.port, args.baud, timeout=0.05)
         print(f"[serial] opened {args.port} @ {args.baud} baud")
     except serial.SerialException as e:
         print(f"[serial] ERROR: {e}")
         sys.exit(1)
 
-    # Open UDP socket
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print(f"[udp]    sending to {ESP_IP}:{ESP_UDP_PORT}")
-    print(f"[frame]  size={FRAME_SIZE} bytes")
-    print(f"[run]    sending {args.count} frames at ~{1/SEND_DELAY_S:.0f} Hz\n")
+    print(f"[run]    {args.count} frames @ {args.hz:.0f} Hz  (frame={FRAME_SIZE}B)\n")
 
-    latencies   = []   # total
-    wifi_rtts   = []
-    uart_legs   = []
+    received_seqs = {}
+    stop_event = threading.Event()
 
+    send_times = {}
+
+    rx_thread = threading.Thread(target=serial_receiver,
+                                 args=(ser, received_seqs, send_times, stop_event),
+                                 daemon=True)
+    rx_thread.start()
+
+    # ── Send loop ────────────────────────────────────────────────────────────
     for seq in range(args.count):
         frame = make_frame(seq)
-
-        # ── Send ────────────────────────────────────────────────────────
-        t_send = time.perf_counter()
+        send_times[seq] = time.perf_counter()
         udp.sendto(frame, (ESP_IP, ESP_UDP_PORT))
-
-        # ── Wait for UDP ack (Leg 1: WiFi round-trip) ────────────────────
-        t_ack = None
-        udp.settimeout(0.2)
-        try:
-            ack_data, _ = udp.recvfrom(16)
-            if len(ack_data) >= 1 and ack_data[0] == ACK_BYTE:
-                t_ack = time.perf_counter()
-        except socket.timeout:
+        next_send = send_times[seq] + send_delay
+        # busy-wait for tight timing at high Hz
+        while time.perf_counter() < next_send:
             pass
 
-        # ── Wait for serial data (Leg 2: UART to laptop) ─────────────────
-        received = b""
-        deadline = time.perf_counter() + 0.5  # 500 ms timeout per frame
-        while len(received) < FRAME_SIZE and time.perf_counter() < deadline:
-            chunk = ser.read(FRAME_SIZE - len(received))
-            received += chunk
+    # Wait for in-flight frames to arrive (up to 500ms after last send)
+    time.sleep(0.5)
+    stop_event.set()
 
-        t_serial = time.perf_counter()
+    # ── Summary ──────────────────────────────────────────────────────────────
+    latencies = []
+    for seq, t_recv in received_seqs.items():
+        if seq in send_times:
+            latencies.append((t_recv - send_times[seq]) * 1000)
 
-        # ── Report ───────────────────────────────────────────────────────
-        byte_count = len(received)
-        hex_dump   = received.hex(' ') if received else '(none)'
+    received = len(received_seqs)
+    lost = args.count - received
 
-        print(f"\n  [frame {seq}]  bytes received: {byte_count}/{FRAME_SIZE}")
-        print(f"  hex: {hex_dump}")
-
-        if byte_count >= FRAME_SIZE:
-            total_ms = (t_serial - t_send) * 1000
-            latencies.append(total_ms)
-
-            try:
-                parsed   = PoseFrame.unpack(received)
-                crc_ok   = True
-                pos_str  = f"pos=({parsed['pos'][0]:.3f}, {parsed['pos'][1]:.3f}, {parsed['pos'][2]:.3f})"
-                quat_str = f"quat=({parsed['quat'][0]:.3f}, {parsed['quat'][1]:.3f}, {parsed['quat'][2]:.3f}, {parsed['quat'][3]:.3f})"
-            except ValueError as e:
-                crc_ok   = False
-                pos_str  = f"({e})"
-                quat_str = ""
-
-            crc_tag = "CRC OK" if crc_ok else "CRC FAIL"
-            print(f"  {crc_tag}  {pos_str}  {quat_str}")
-
-            if t_ack is not None:
-                wifi_ms = (t_ack    - t_send)  * 1000
-                uart_ms = (t_serial - t_ack)   * 1000
-                wifi_rtts.append(wifi_ms)
-                uart_legs.append(uart_ms)
-                print(f"  total={total_ms:.2f}ms  wifi_rtt={wifi_ms:.2f}ms  uart_leg={uart_ms:.2f}ms")
-            else:
-                print(f"  total={total_ms:.2f}ms  (no ack received)")
-        else:
-            print(f"  TIMEOUT")
-
-        time.sleep(SEND_DELAY_S)
-
-    # ── Summary ──────────────────────────────────────────────────────────
-    print(f"\n── Results {'─'*36}")
+    print(f"── Results {'─'*36}")
     print(f"  frames sent     : {args.count}")
-    print(f"  frames received : {len(latencies)}")
-    print(f"  packet loss     : {args.count - len(latencies)}")
+    print(f"  frames received : {received}")
+    print(f"  packet loss     : {lost}  ({100*lost/args.count:.1f}%)")
 
     if latencies:
-        def stats(label, data):
-            if not data:
-                return
-            avg = sum(data) / len(data)
-            print(f"  {label:<16}: avg={avg:6.2f}ms  min={min(data):6.2f}ms  max={max(data):6.2f}ms")
-
-        stats("total latency",  latencies)
-        stats("WiFi RTT",       wifi_rtts)
-        stats("UART leg",       uart_legs)
+        avg = sum(latencies) / len(latencies)
+        print(f"  latency avg     : {avg:.2f}ms")
+        print(f"  latency min     : {min(latencies):.2f}ms")
+        print(f"  latency max     : {max(latencies):.2f}ms")
 
     udp.close()
     ser.close()
