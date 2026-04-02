@@ -1,27 +1,26 @@
 import serial
-import struct
+from pose_frame import PoseFrame, FRAME_SIZE, MAGIC_BYTES
 
-PORT     = "COM7"       # change to your port
-BAUD     = 921600
-MAGIC    = 0xABCD
-FMT      = "<HH7f"
-SIZE     = struct.calcsize(FMT)  # 32 bytes
-MAGIC_BYTES = struct.pack("<H", MAGIC)
+PORT = "/dev/ttyUSB0"    # CP2102 → frame data (IDF console is on /dev/ttyACM0)
+BAUD = 115200
 
 s = serial.Serial(PORT, BAUD, timeout=0.05)
-print(f"Listening on {PORT}...")
+print(f"Listening on {PORT} @ {BAUD} baud  (frame={FRAME_SIZE}B)...")
 
 buf = b""
 while True:
     chunk = s.read(max(1, s.in_waiting))
     if chunk:
         buf += chunk
-    while len(buf) >= SIZE:
+    while len(buf) >= FRAME_SIZE:
         if buf[:2] != MAGIC_BYTES:
-            # re-sync: advance one byte at a time until magic aligns
             buf = buf[1:]
             continue
-        magic, seq, px, py, pz, qw, qx, qy, qz = struct.unpack_from(FMT, buf)
-        print(f"seq={seq:>5}  pos=({px:.3f}, {py:.3f}, {pz:.3f})  "
-              f"quat=({qw:.3f}, {qx:.3f}, {qy:.3f}, {qz:.3f})")
-        buf = buf[SIZE:]
+        try:
+            parsed = PoseFrame.unpack(buf[:FRAME_SIZE])
+            p, q   = parsed["pos"], parsed["quat"]
+            print(f"pos=({p[0]:.4f}, {p[1]:.4f}, {p[2]:.4f})  "
+                  f"quat=({q[0]:.4f}, {q[1]:.4f}, {q[2]:.4f}, {q[3]:.4f})")
+            buf = buf[FRAME_SIZE:]
+        except ValueError:
+            buf = buf[1:]  # CRC fail or bad magic — re-sync

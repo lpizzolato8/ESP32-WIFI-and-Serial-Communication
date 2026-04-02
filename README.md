@@ -42,8 +42,8 @@ The Linux Laptop uses one USB-C port and one USB-A Port:
 
 | Port label | Linux device  | Purpose                              |
 |------------|---------------|--------------------------------------|
-| USB (native CDC) | `/dev/ttyACM0` | Flashing, IDF monitor, frame data, ESP32 Power |
-| UART (CP2102)    | `/dev/ttyUSB0` | Alternative serial path                        |
+| USB (CH9102 CDC) | `/dev/ttyACM0` | IDF monitor / console (UART0 GPIO43/44) |
+| UART (CP2102)    | `/dev/ttyUSB0` | Frame data (UART1 GPIO17/18)           |
 
 ### Wiring
 
@@ -51,7 +51,7 @@ The Linux Laptop uses one USB-C port and one USB-A Port:
 
 | ESP32 Pin | Connects to       | Purpose                            |
 |-----------|-------------------|------------------------------------|
-| GPIO17    | CP2102 RX pin     | UART1 TX → USB serial → /dev/ttyACM0 |
+| GPIO17    | CP2102 RX pin     | UART1 TX → USB serial → /dev/ttyUSB0 |
 | GPIO18    | (unused)          | UART1 RX — not connected           |
 | GND       | CP2102 GND        | Common ground                      |
 
@@ -84,29 +84,27 @@ To change SSID or password edit the define block at the top of `main/wifi_ap.c`.
 
 ## Frame format (Python → ESP32 → receiver)
 
-Defined in `pose_frame.py`. The ESP32 forwards all 34 bytes verbatim.
+Defined in `pose_frame.py`. The ESP32 forwards all 21 bytes verbatim.
 
-| Offset | Size | Field  | Type    | Notes                           |
-|--------|------|--------|---------|---------------------------------|
-| 0      | 2    | magic  | uint16  | Always 0xABCD, little-endian    |
-| 2      | 2    | seq    | uint16  | Rolling counter, wraps at 65535 |
-| 4      | 4    | pos_x  | float32 | Metres, little-endian           |
-| 8      | 4    | pos_y  | float32 |                                 |
-| 12     | 4    | pos_z  | float32 |                                 |
-| 16     | 4    | quat_w | float32 | Quaternion scalar               |
-| 20     | 4    | quat_x | float32 |                                 |
-| 24     | 4    | quat_y | float32 |                                 |
-| 28     | 4    | quat_z | float32 |                                 |
-| 32     | 2    | crc16  | uint16  | CRC-16/CCITT-FALSE over [0..31] |
-| Total  | 34   |        |         |                                 |
+| Offset | Size | Field  | Type   | Encoding                              |
+|--------|------|--------|--------|---------------------------------------|
+| 0      | 2    | magic  | uint16 | 0xABCD little-endian — frame sync     |
+| 2      | 3    | pos_x  | int24  | metres × 10000 (0.1mm res, ±838m)    |
+| 5      | 3    | pos_y  | int24  | metres × 10000                        |
+| 8      | 3    | pos_z  | int24  | metres × 10000                        |
+| 11     | 2    | quat_w | int16  | component × 32767 (~0.00003 res)      |
+| 13     | 2    | quat_x | int16  | component × 32767                     |
+| 15     | 2    | quat_y | int16  | component × 32767                     |
+| 17     | 2    | quat_z | int16  | component × 32767                     |
+| 19     | 2    | crc16  | uint16 | CRC-16/CCITT-FALSE over bytes [0..18] |
+| **21** |      |        |        |                                       |
 
 The magic field lets the receiver find frame boundaries in the UART stream
 even after a reset or partial receive. Both `read_serial.py` and `test_bridge.py`
-re-sync byte-by-byte when magic is not found, and drop frames that fail CRC.
+re-sync byte-by-byte on bad magic or CRC failure.
 
-Note: `main/pose_frame.h` defines a separate compact 20-byte format (int24
-positions, int16 quaternions) intended for the STM32 to use when encoding its
-own outbound frames. It is not used by the passthrough bridge.
+`main/pose_frame.h` defines the same fixed-point format as a C struct for the
+STM32 to decode on the receiving end.
 
 ---
 
@@ -207,7 +205,7 @@ sudo usermod -a -G dialout $USER
 ```
 I (604) wifi_ap: AP ready  IP: 192.168.4.1  Password: "esp32pass"
 I (614) wifi_ap: Soft-AP started  SSID: "ESP32S3-Hotspot"  CH: 6
-I (624) udp_uart: UART1 ready  baud=115200  TX=GPIO43  RX=GPIO44
+I (624) udp_uart: UART1 ready  baud=921600  TX=GPIO17  RX=GPIO18
 I (634) udp_uart: bridge_task started
 I (634) udp_uart: UDP bridge listening on 192.168.4.1:4444
 I (634) main: Ready. Send UDP datagrams to 192.168.4.1:4444
@@ -239,34 +237,35 @@ a separate thread, measuring per-frame latency, CRC integrity, and packet loss.
 
 ```bash
 cd ~/ESP32Communication
-python3 test_bridge.py --port /dev/ttyACM0 --baud 115200 --hz 200
+python3 test_bridge.py --port /dev/ttyUSB0 --baud 921600 --hz 250
 ```
 
-Sample output (confirmed working — 200 Hz, 0% packet loss, 0 CRC failures):
+Sample output (confirmed working — 250 Hz, 0% packet loss, 0 CRC failures):
 
 ```
-[serial] opened /dev/ttyACM0 @ 115200 baud
+[serial] opened /dev/ttyUSB0 @ 921600 baud
 [udp]    sending to 192.168.4.1:4444
-[run]    200 frames @ 200 Hz  (frame=34B)
+[run]    250 frames @ 250 Hz  (frame=21B)
 
-  seq=    0  latency=8.66ms  pos=(1.000, 2.000, 3.000)
-  seq=    1  latency=7.03ms  pos=(1.000, 2.000, 3.000)
+  frame     1  latency=5.81ms  pos=(1.0000, 2.0000, 3.0000)
+  frame     2  latency=4.19ms  pos=(1.0000, 2.0000, 3.0000)
   ...
-  seq=  199  latency=8.06ms  pos=(1.000, 2.000, 3.000)
-[serial] raw bytes received: 6800
-── Results ────────────────────────────────────
-  frames sent     : 200
-  frames received : 200  (CRC OK)
+  frame   250  latency=6.55ms  pos=(1.0000, 2.0000, 3.0000)
+[serial] raw bytes received: 5250
+── Results ────────────────────────────────────────────────────────────────
+  frames sent     : 250
+  frames received : 250  (CRC OK)
   CRC failures    : 0
   never arrived   : 0  (lost in WiFi/UART)
   packet loss     : 0  (0.0%)
-  latency avg     : 10.08ms
-  latency min     :  5.97ms
-  latency max     : 44.29ms
+  latency avg     : 4.66ms
+  latency min     : 2.83ms
+  latency p95     : 10.17ms
+  latency max     : 20.44ms
 ```
 
-The occasional latency spike (up to ~44ms) is normal WiFi jitter. Baseline
-latency is ~6ms.
+The occasional latency spike is normal WiFi jitter. Baseline latency is ~3ms.
+p95 latency is under 11ms — well within drone control requirements.
 
 A `[warn]` line is printed if the requested Hz exceeds 80% of UART capacity.
 
@@ -275,14 +274,14 @@ A `[warn]` line is printed if the requested Hz exceeds 80% of UART capacity.
 `read_serial.py` prints frames as they arrive without sending anything:
 
 ```bash
-python3 read_serial.py   # edit PORT at the top to match your port
+python3 read_serial.py   # PORT defaults to /dev/ttyUSB0
 ```
 
 Expected output:
 
 ```
-seq=    0  pos=(1.000, 2.000, 3.000)  quat=(1.000, 0.000, 0.000, 0.000)
-seq=    1  pos=(1.000, 2.000, 3.000)  quat=(1.000, 0.000, 0.000, 0.000)
+pos=(1.0000, 2.0000, 3.0000)  quat=(1.0000, 0.0000, 0.0000, 0.0000)
+pos=(1.0000, 2.0000, 3.0000)  quat=(1.0000, 0.0000, 0.0000, 0.0000)
 ```
 
 ---
@@ -310,17 +309,17 @@ seq=    1  pos=(1.000, 2.000, 3.000)  quat=(1.000, 0.000, 0.000, 0.000)
 
 ### test_bridge.py
 
-| Argument | Default      | Description                              |
-|----------|--------------|------------------------------------------|
-| --port   | /dev/ttyUSB0 | Serial port                              |
-| --baud   | 115200       | Must match firmware                      |
-| --hz     | 200          | Send rate (90% capacity = 304 Hz at 115200 baud) |
-| --count  | 200          | Number of frames to send                 |
+| Argument | Default       | Description                               |
+|----------|---------------|-------------------------------------------|
+| --port   | /dev/ttyUSB0  | Serial port (CP2102, frame data)          |
+| --baud   | 921600        | Must match firmware                       |
+| --hz     | 250           | Send rate (90% capacity = 3942 Hz at 921600 baud with 21B frames) |
+| --count  | 250           | Number of frames to send                  |
 
 ### Latency targets for drone control
 
-| Control loop          | Acceptable latency | Achieved  |
-|-----------------------|--------------------|-----------|
-| Position / velocity   | < 50ms             | ✓ avg 10ms |
-| Pilot command input   | < 20ms             | ✓ avg 10ms |
-| Attitude stabilisation| < 10ms             | ~ baseline 6ms, spikes to 44ms |
+| Control loop          | Acceptable latency | Achieved                        |
+|-----------------------|--------------------|----------------------------------|
+| Position / velocity   | < 50ms             | ✓ avg 4.7ms                     |
+| Pilot command input   | < 20ms             | ✓ avg 4.7ms, p95 10ms           |
+| Attitude stabilisation| < 10ms             | ✓ baseline ~3ms, spikes to ~20ms |

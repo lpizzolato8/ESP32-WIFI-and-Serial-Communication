@@ -28,7 +28,7 @@
 #define BRIDGE_UDP_PORT  4444
 
 #define UART_PORT_NUM    UART_NUM_1
-#define UART_BAUD_RATE   115200
+#define UART_BAUD_RATE   921600
 #define UART_TX_PIN      17       /* GPIO17 → CP2102 RX → USB serial         */
 #define UART_RX_PIN      18       /* GPIO18 ← CP2102 TX (unused)             */
 #define UART_BUF_SIZE    1024     /* Must be > largest expected UDP payload  */
@@ -102,8 +102,6 @@ static void bridge_task(void *arg)
 
         int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0,
                            (struct sockaddr *)&src, &src_len);
-
-        ESP_LOGI(TAG, "recvfrom returned %d", len);
 
         if (len < 0) {
  	    ESP_LOGW(TAG, "recvfrom() error: errno %d", errno);

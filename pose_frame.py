@@ -1,9 +1,24 @@
 import struct
 
-POSE_FRAME_MAGIC = 0xABCD
-FRAME_FORMAT     = "<HH7f"
-_PAYLOAD_SIZE    = struct.calcsize(FRAME_FORMAT)  # 32 bytes (no CRC)
-FRAME_SIZE       = _PAYLOAD_SIZE + 2              # 34 bytes (+ 2-byte CRC16)
+MAGIC      = 0xABCD
+FRAME_SIZE = 21       # 2 magic + 9 pos (3×int24) + 8 quat (4×int16) + 2 CRC
+
+POS_SCALE  = 10000.0  # metres → int24   (0.1 mm resolution, ±838 m range)
+QUAT_SCALE = 32767.0  # [-1, 1] → int16  (~0.00003 resolution)
+
+MAGIC_BYTES = struct.pack("<H", MAGIC)
+
+
+def _enc24(metres: float) -> bytes:
+    raw = int(round(metres * POS_SCALE)) & 0xFFFFFF
+    return bytes([raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF])
+
+
+def _dec24(b: bytes) -> float:
+    v = b[0] | (b[1] << 8) | (b[2] << 16)
+    if v & 0x800000:
+        v -= 0x1000000  # sign-extend from 24-bit
+    return v / POS_SCALE
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -19,25 +34,35 @@ def crc16_ccitt(data: bytes) -> int:
 
 class PoseFrame:
     @staticmethod
-    def pack(seq, pos_x, pos_y, pos_z, quat_w, quat_x, quat_y, quat_z) -> bytes:
-        payload = struct.pack(FRAME_FORMAT,
-                              POSE_FRAME_MAGIC, seq,
-                              pos_x, pos_y, pos_z,
-                              quat_w, quat_x, quat_y, quat_z)
-        crc = crc16_ccitt(payload)
-        return payload + struct.pack("<H", crc)
+    def pack(pos_x: float, pos_y: float, pos_z: float,
+             quat_w: float, quat_x: float, quat_y: float, quat_z: float) -> bytes:
+        payload = (
+            struct.pack("<H", MAGIC) +
+            _enc24(pos_x) + _enc24(pos_y) + _enc24(pos_z) +
+            struct.pack("<4h",
+                        int(round(quat_w * QUAT_SCALE)),
+                        int(round(quat_x * QUAT_SCALE)),
+                        int(round(quat_y * QUAT_SCALE)),
+                        int(round(quat_z * QUAT_SCALE)))
+        )  # 19 bytes
+        return payload + struct.pack("<H", crc16_ccitt(payload))  # 21 bytes
 
     @staticmethod
     def unpack(data: bytes) -> dict:
-        """Unpack and CRC-validate a frame. Raises ValueError on bad magic or CRC."""
         if len(data) < FRAME_SIZE:
             raise ValueError(f"Too short: {len(data)} < {FRAME_SIZE}")
-        payload = data[:_PAYLOAD_SIZE]
-        (recv_crc,) = struct.unpack_from("<H", data, _PAYLOAD_SIZE)
-        calc_crc = crc16_ccitt(payload)
-        if calc_crc != recv_crc:
-            raise ValueError(f"CRC mismatch: got 0x{recv_crc:04X}, expected 0x{calc_crc:04X}")
-        magic, seq, px, py, pz, qw, qx, qy, qz = struct.unpack_from(FRAME_FORMAT, payload)
-        if magic != POSE_FRAME_MAGIC:
-            raise ValueError(f"Bad magic: 0x{magic:04X}")
-        return dict(seq=seq, pos=(px, py, pz), quat=(qw, qx, qy, qz))
+        payload  = data[:FRAME_SIZE - 2]
+        recv_crc = struct.unpack_from("<H", data, FRAME_SIZE - 2)[0]
+        if crc16_ccitt(payload) != recv_crc:
+            raise ValueError("CRC mismatch")
+        if struct.unpack_from("<H", payload, 0)[0] != MAGIC:
+            raise ValueError("Bad magic")
+        px = _dec24(payload[2:5])
+        py = _dec24(payload[5:8])
+        pz = _dec24(payload[8:11])
+        qw, qx, qy, qz = struct.unpack_from("<4h", payload, 11)
+        return dict(
+            pos=(px, py, pz),
+            quat=(qw / QUAT_SCALE, qx / QUAT_SCALE,
+                  qy / QUAT_SCALE, qz / QUAT_SCALE)
+        )
