@@ -29,8 +29,8 @@
 
 #define UART_PORT_NUM    UART_NUM_1
 #define UART_BAUD_RATE   115200
-#define UART_TX_PIN      43       /* GPIO43 → CP2102 RX → USB serial         */
-#define UART_RX_PIN      44       /* GPIO44 ← CP2102 TX ← USB serial         */
+#define UART_TX_PIN      17       /* GPIO17 → CP2102 RX → USB serial         */
+#define UART_RX_PIN      18       /* GPIO18 ← CP2102 TX (unused)             */
 #define UART_BUF_SIZE    1024     /* Must be > largest expected UDP payload  */
 
 #define TASK_STACK       4096

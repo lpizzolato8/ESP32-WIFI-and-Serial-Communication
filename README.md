@@ -45,23 +45,26 @@ The Linux Laptop uses one USB-C port and one USB-A Port:
 | USB (native CDC) | `/dev/ttyACM0` | Flashing, IDF monitor, frame data, ESP32 Power |
 | UART (CP2102)    | `/dev/ttyUSB0` | Alternative serial path                        |
 
-### UART modes
+### Wiring
 
-**Laptop and STM32 mode (future)**:
+**Current setup — GPIO17 wired to CP2102 RX (laptop testing):**
 
-| ESP32 Pin | Connects to  | Purpose               |
-|-----------|--------------|-----------------------|
-| GPIO17    | STM32 TX     | UART1 data out        |
-| GPIO18    | STM32 RX     | UART1 data in (future)|
-| GND       | STM32 GND    | Common ground         |
+| ESP32 Pin | Connects to       | Purpose                            |
+|-----------|-------------------|------------------------------------|
+| GPIO17    | CP2102 RX pin     | UART1 TX → USB serial → /dev/ttyACM0 |
+| GPIO18    | (unused)          | UART1 RX — not connected           |
+| GND       | CP2102 GND        | Common ground                      |
 
-To switch to STM32 mode, change these defines in `main/udp_uart_bridge.c`:
+**Future STM32 setup** — same GPIO17/18 pins, just connect to the STM32 instead:
 
-```c
-#define UART_PORT_NUM    UART_NUM_1
-#define UART_TX_PIN      17
-#define UART_RX_PIN      18
-```
+| ESP32 Pin | Connects to  | Purpose          |
+|-----------|--------------|------------------|
+| GPIO17    | STM32 RX     | UART1 data out   |
+| GPIO18    | STM32 TX     | UART1 data in    |
+| GND       | STM32 GND    | Common ground    |
+
+No firmware change needed when switching to the STM32 — just rewire GPIO17 from
+the CP2102 to the STM32 RX pin.
 ---
 
 ## Network settings
@@ -297,13 +300,13 @@ seq=    1  pos=(1.000, 2.000, 3.000)  quat=(1.000, 0.000, 0.000, 0.000)
 
 ### main/udp_uart_bridge.c
 
-| Define          | Current        | STM32 mode  | Description                      |
-|-----------------|----------------|-------------|----------------------------------|
-| BRIDGE_UDP_PORT | 4444           | 4444        | UDP port to listen on            |
-| UART_PORT_NUM   | UART_NUM_1     | UART_NUM_1  | UART instance                    |
-| UART_BAUD_RATE  | 115200         | 115200      | Must match receiver              |
-| UART_TX_PIN     | 43             | 17          | TX GPIO (43 = CP2102, 17 = STM32)|
-| UART_RX_PIN     | 44             | 18          | RX GPIO                          |
+| Define          | Value      | Description                              |
+|-----------------|------------|------------------------------------------|
+| BRIDGE_UDP_PORT | 4444       | UDP port to listen on                    |
+| UART_PORT_NUM   | UART_NUM_1 | UART instance                            |
+| UART_BAUD_RATE  | 115200     | Must match receiver baud rate            |
+| UART_TX_PIN     | 17         | GPIO17 TX → CP2102 RX (or STM32 RX)     |
+| UART_RX_PIN     | 18         | GPIO18 RX ← unused (or STM32 TX)        |
 
 ### test_bridge.py
 
