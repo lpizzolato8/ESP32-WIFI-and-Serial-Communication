@@ -24,15 +24,11 @@ import sys
 ESP_IP       = "192.168.4.1"
 ESP_UDP_PORT = 4444
 
-SEND_COUNT   = 300     # frames to send per run
-HZ           = 300     # target send rate
+SEND_COUNT   = 200     # frames to send per run
+HZ           = 200     # target send rate
 
 MAGIC        = 0xABCD
 MAGIC_BYTES  = struct.pack("<H", MAGIC)
-
-# ESP32 forwards the payload only (no CRC appended)
-SERIAL_FMT   = "<HH7f"
-SERIAL_SIZE  = struct.calcsize(SERIAL_FMT)  # 32 bytes
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -44,31 +40,33 @@ def make_frame(seq: int) -> bytes:
 
 # ── Receiver thread ──────────────────────────────────────────────────────────
 
-def serial_receiver(ser, received_seqs: dict, send_times: dict, stop_event: threading.Event):
+def serial_receiver(ser, received_seqs: dict, send_times: dict, stop_event: threading.Event,
+                    counters: dict):
     """Reads frames from serial, records arrival time keyed by seq number."""
     buf = b""
-    raw_bytes = 0
     while not stop_event.is_set():
         chunk = ser.read(max(1, ser.in_waiting))
         if chunk:
             buf += chunk
-            raw_bytes += len(chunk)
-        while len(buf) >= SERIAL_SIZE:
+            counters["raw_bytes"] += len(chunk)
+        while len(buf) >= FRAME_SIZE:
             if buf[:2] != MAGIC_BYTES:
                 buf = buf[1:]
                 continue
             try:
-                magic, seq, px, py, pz, qw, qx, qy, qz = struct.unpack_from(SERIAL_FMT, buf)
+                parsed = PoseFrame.unpack(buf[:FRAME_SIZE])
                 t_recv = time.perf_counter()
+                seq = parsed["seq"]
                 received_seqs[seq] = t_recv
                 if seq in send_times:
                     latency_ms = (t_recv - send_times[seq]) * 1000
                     print(f"  seq={seq:>5}  latency={latency_ms:.2f}ms  "
-                          f"pos=({px:.3f}, {py:.3f}, {pz:.3f})")
-            except struct.error:
-                pass
-            buf = buf[SERIAL_SIZE:]
-    print(f"[serial] raw bytes received: {raw_bytes}")
+                          f"pos=({parsed['pos'][0]:.3f}, {parsed['pos'][1]:.3f}, {parsed['pos'][2]:.3f})")
+                buf = buf[FRAME_SIZE:]
+            except ValueError:
+                counters["crc_fail"] += 1
+                buf = buf[1:]  # CRC fail — re-sync byte by byte
+    print(f"[serial] raw bytes received: {counters['raw_bytes']}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -101,11 +99,12 @@ def main():
 
     received_seqs = {}
     stop_event = threading.Event()
+    counters = {"raw_bytes": 0, "crc_fail": 0}
 
     send_times = {}
 
     rx_thread = threading.Thread(target=serial_receiver,
-                                 args=(ser, received_seqs, send_times, stop_event),
+                                 args=(ser, received_seqs, send_times, stop_event, counters),
                                  daemon=True)
     rx_thread.start()
 
@@ -115,13 +114,17 @@ def main():
         send_times[seq] = time.perf_counter()
         udp.sendto(frame, (ESP_IP, ESP_UDP_PORT))
         next_send = send_times[seq] + send_delay
-        # busy-wait for tight timing at high Hz
+        # sleep most of the interval to release the GIL, then busy-wait the last 0.5ms
+        remaining = next_send - time.perf_counter()
+        if remaining > 0.0005:
+            time.sleep(remaining - 0.0005)
         while time.perf_counter() < next_send:
             pass
 
     # Wait for in-flight frames to arrive (up to 500ms after last send)
     time.sleep(0.5)
     stop_event.set()
+    rx_thread.join(timeout=1.0)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     latencies = []
@@ -134,7 +137,9 @@ def main():
 
     print(f"── Results {'─'*36}")
     print(f"  frames sent     : {args.count}")
-    print(f"  frames received : {received}")
+    print(f"  frames received : {received}  (CRC OK)")
+    print(f"  CRC failures    : {counters['crc_fail']}")
+    print(f"  never arrived   : {lost - counters['crc_fail']}  (lost in WiFi/UART)")
     print(f"  packet loss     : {lost}  ({100*lost/args.count:.1f}%)")
 
     if latencies:

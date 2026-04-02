@@ -2,7 +2,7 @@ import serial
 import struct
 
 PORT     = "COM7"       # change to your port
-BAUD     = 115200
+BAUD     = 921600
 MAGIC    = 0xABCD
 FMT      = "<HH7f"
 SIZE     = struct.calcsize(FMT)  # 32 bytes
