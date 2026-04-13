@@ -1,4 +1,4 @@
-# ESP32-S3-N16R8 WiFi to UART Bridge
+# ESP32-S3-N16R8 WiFi-UART Bridge
 
 A complete ESP-IDF project that turns the ESP32-S3-N16R8 into a WiFi hotspot
 that receives binary pose frames (position + quaternion) over UDP and forwards
