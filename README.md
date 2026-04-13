@@ -19,7 +19,7 @@ test_bridge.py  ── WiFi UDP:4444 ──► udp_uart_bridge ── UART ─�
 
 Linux laptop                  ESP32-S3                        Linux laptop
 ────────────                  ────────                        ────────────
-/dev/ttyACM0  ── UART ──► udp_uart_bridge ── WiFi UDP:4444 ──► test_bridge.py
+/dev/ttyACM0  ── UART ──► udp_uart_bridge ── WiFi UDP:4444 ──► bridge_receive.py
                                                192.168.4.1
 ```
 
