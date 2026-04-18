@@ -1,15 +1,16 @@
 /**
- * udp_uart_bridge.c  –  UDP datagram → UART passthrough
+ * udp_uart_bridge.c  –  Bidirectional UDP↔UART bridge
  *
- * Laptop sends a binary frame as a UDP packet to 192.168.4.1:BRIDGE_UDP_PORT.
- * The ESP32 writes the raw bytes to UART (TX pin) verbatim.
- * No parsing, no framing — pure passthrough.
+ * Forward  (Task 1 – bridge_task):
+ *   Laptop UDP → ESP32 port 4444 → UART TX (GPIO17) → laptop serial RX
  *
- * UART pinout (change UART_TX_PIN / UART_RX_PIN to match your wiring):
- *   GPIO17 → STM32 RX
- *   GPIO18 ← STM32 TX  (wired but unused in this one-way flow)
+ * Reverse  (Task 2 – uart_udp_task):
+ *   Laptop serial TX → UART RX (GPIO18) → ESP32 UDP → laptop port 4445
+ *   Laptop IP is learned from the first forward UDP packet received.
  *
- * Tune BRIDGE_UDP_PORT, UART_BAUD_RATE, and UART_BUF_SIZE below.
+ * UART pinout:
+ *   GPIO17 → CP2102 RX  (UART TX, forward path)
+ *   GPIO18 ← CP2102 TX  (UART RX, reverse path)
  */
 
 #include "udp_uart_bridge.h"
@@ -25,20 +26,27 @@
 
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
-#define BRIDGE_UDP_PORT  4444
+#define BRIDGE_UDP_PORT   4444
+#define REVERSE_UDP_PORT  4445  /* laptop listens here for reverse data */
 
 #define UART_PORT_NUM    UART_NUM_1
 #define UART_BAUD_RATE   921600
-#define UART_TX_PIN      17       /* GPIO17 → CP2102 RX → USB serial         */
-#define UART_RX_PIN      18       /* GPIO18 ← CP2102 TX (unused)             */
+#define UART_TX_PIN      17       /* GPIO17 → CP2102 RX (forward TX)         */
+#define UART_RX_PIN      18       /* GPIO18 ← CP2102 TX (reverse RX)         */
 #define UART_BUF_SIZE    1024     /* Must be > largest expected UDP payload  */
 
 #define TASK_STACK       4096
 #define TASK_PRIORITY    6        /* Higher than default; keeps latency low  */
+#define REV_TASK_STACK   4096
+#define REV_TASK_PRIO    5
 
 /* ── Internals ──────────────────────────────────────────────────────────── */
 
 static const char *TAG = "udp_uart";
+
+/* Laptop address learned from the first forward UDP packet. */
+static volatile bool      s_client_valid = false;
+static struct sockaddr_in s_client_addr  = {0};
 
 static void uart_init(void)
 {
@@ -111,6 +119,16 @@ static void bridge_task(void *arg)
             continue;
         }
 
+        /* Learn the laptop's address for the reverse UDP path. */
+        if (!s_client_valid) {
+            s_client_addr       = src;
+            s_client_addr.sin_port = htons(REVERSE_UDP_PORT);
+            s_client_valid      = true;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));
+            ESP_LOGI(TAG, "Learned client address: %s → reverse UDP to :%d", ip, REVERSE_UDP_PORT);
+        }
+
         /* Send a 1-byte UDP ack back to the sender *before* writing to UART.
          * The laptop timestamps this to split WiFi latency from UART latency. */
         uint8_t ack = 0xAC;
@@ -137,8 +155,47 @@ static void bridge_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ── Reverse task: UART RX → UDP TX ─────────────────────────────────────── */
+
+static void uart_udp_task(void *arg)
+{
+    static uint8_t buf[UART_BUF_SIZE];
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "reverse udp socket() failed: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Reverse UDP task started, waiting for client address");
+
+    while (1) {
+        /* Wait until bridge_task has seen the first forward packet. */
+        if (!s_client_valid) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        int len = uart_read_bytes(UART_PORT_NUM, buf, sizeof(buf), pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+
+        int sent = sendto(sock, buf, len, 0,
+                          (struct sockaddr *)&s_client_addr, sizeof(s_client_addr));
+        if (sent < 0) {
+            ESP_LOGW(TAG, "Reverse UDP sendto failed: errno %d", errno);
+        } else {
+            ESP_LOGD(TAG, "Reverse: %d bytes UART → UDP", sent);
+        }
+    }
+
+    close(sock);
+    vTaskDelete(NULL);
+}
+
 void udp_uart_bridge_start(void)
 {
     uart_init();
-    xTaskCreate(bridge_task, "udp_uart", TASK_STACK, NULL, TASK_PRIORITY, NULL);
+    xTaskCreate(bridge_task,   "udp_uart", TASK_STACK,     NULL, TASK_PRIORITY, NULL);
+    xTaskCreate(uart_udp_task, "uart_udp", REV_TASK_STACK, NULL, REV_TASK_PRIO, NULL);
 }

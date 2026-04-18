@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-test_bridge.py  –  Send binary frames over UDP to the ESP32 bridge,
-                   read them back from the local serial port, and
-                   report packet loss and latency.
+test_bridge.py  –  Bidirectional ESP32 bridge tester.
+
+  Forward  (high-rate): Laptop ──UDP──► ESP32 ──UART──► Laptop serial RX
+  Reverse  (low-rate) : Laptop ──UART──► ESP32 ──UDP──► Laptop UDP RX
+
+All four paths run simultaneously in separate threads.
 
 Usage:
-    python3 test_bridge.py --port /dev/ttyACM0 --baud 921600
+    python3 test_bridge.py --port /dev/ttyUSB0 --baud 921600
 
 Dependencies:
     pip install pyserial
@@ -21,11 +24,13 @@ import sys
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-ESP_IP       = "192.168.4.1"
-ESP_UDP_PORT = 4444
+ESP_IP            = "192.168.4.1"
+ESP_UDP_PORT      = 4444          # ESP32 listens here (forward path)
+REVERSE_UDP_PORT  = 4445          # Laptop listens here (reverse path)
 
-SEND_COUNT   = 250
-HZ           = 250
+SEND_COUNT        = 250
+HZ                = 250
+REVERSE_HZ        = 10            # Reverse channel send rate
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -34,7 +39,29 @@ def make_frame() -> bytes:
                           quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
 
 
-# ── Receiver thread ──────────────────────────────────────────────────────────
+# Reverse frame: 4-byte magic + 4-byte counter + 128-byte payload + 2-byte CRC-16
+# Total: 138 bytes  (1104 bits)
+_REV_MAGIC        = b"REV\xAA"
+REV_PAYLOAD_SIZE  = 128
+REV_FRAME_SIZE    = len(_REV_MAGIC) + 4 + REV_PAYLOAD_SIZE + 2  # 138
+
+def _crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+        crc &= 0xFFFF
+    return crc
+
+def make_reverse_frame(counter: int) -> bytes:
+    # 128-byte payload: counter repeated as uint32 LE to fill the space
+    payload = (struct.pack("<I", counter & 0xFFFFFFFF) * (REV_PAYLOAD_SIZE // 4))
+    body = _REV_MAGIC + struct.pack("<I", counter & 0xFFFFFFFF) + payload
+    return body + struct.pack("<H", _crc16(body))
+
+
+# ── Forward serial receiver (ESP32 → UART → Laptop) ─────────────────────────
 
 def serial_receiver(ser, recv_times: list, send_times: list,
                     stop_event: threading.Event, counters: dict):
@@ -73,14 +100,56 @@ def serial_receiver(ser, recv_times: list, send_times: list,
     print(f"[serial] raw bytes received: {counters['raw_bytes']}")
 
 
+# ── Reverse serial sender (Laptop → UART → ESP32) ───────────────────────────
+
+def serial_sender(ser, stop_event: threading.Event, hz: float, counters: dict):
+    delay = 1.0 / hz
+    counter = 0
+    while not stop_event.is_set():
+        t0 = time.perf_counter()
+        frame = make_reverse_frame(counter)
+        ser.write(frame)
+        counters["rev_sent"] += 1
+        counter += 1
+        remaining = delay - (time.perf_counter() - t0)
+        if remaining > 0.0005:
+            time.sleep(remaining - 0.0005)
+        while time.perf_counter() < t0 + delay:
+            pass
+
+
+# ── Reverse UDP receiver (ESP32 → WiFi/UDP → Laptop) ────────────────────────
+
+def udp_receiver(sock: socket.socket, stop_event: threading.Event, counters: dict):
+    sock.settimeout(0.1)
+    while not stop_event.is_set():
+        try:
+            # Each recvfrom() returns exactly one datagram = one complete frame.
+            data, _ = sock.recvfrom(512)
+            if len(data) < REV_FRAME_SIZE or data[:4] != _REV_MAGIC:
+                continue
+            body, recv_crc = data[:REV_FRAME_SIZE - 2], struct.unpack("<H", data[REV_FRAME_SIZE - 2:REV_FRAME_SIZE])[0]
+            if _crc16(body) == recv_crc:
+                counter_val = struct.unpack("<I", data[4:8])[0]
+                counters["rev_recv"] += 1
+                print(f"[rev-udp] frame {counter_val:>6}  {REV_FRAME_SIZE}B  CRC OK")
+            else:
+                counters["rev_crc_fail"] += 1
+        except socket.timeout:
+            pass
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="ESP32 UDP→UART bridge tester")
-    parser.add_argument("--port",  default="/dev/ttyUSB0", help="Serial port")
-    parser.add_argument("--baud",  default=921600, type=int,   help="Baud rate")
-    parser.add_argument("--count", default=SEND_COUNT, type=int, help="Frames to send")
-    parser.add_argument("--hz",    default=HZ, type=float,    help="Send rate in Hz")
+    parser = argparse.ArgumentParser(description="ESP32 bidirectional UDP↔UART bridge tester")
+    parser.add_argument("--port",       default="/dev/ttyUSB0", help="Serial port")
+    parser.add_argument("--baud",       default=921600, type=int,   help="Baud rate")
+    parser.add_argument("--count",      default=SEND_COUNT, type=int, help="Forward frames to send")
+    parser.add_argument("--hz",         default=HZ, type=float,    help="Forward send rate in Hz")
+    parser.add_argument("--rev-hz",     default=REVERSE_HZ, type=float, help="Reverse send rate in Hz")
+    parser.add_argument("--rev-port",   default=REVERSE_UDP_PORT, type=int,
+                        help="ESP32 TCP port for reverse data (default 4445)")
     args = parser.parse_args()
 
     send_delay = 1.0 / args.hz
@@ -97,25 +166,45 @@ def main():
         print(f"[serial] ERROR: {e}")
         sys.exit(1)
 
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print(f"[udp]    sending to {ESP_IP}:{ESP_UDP_PORT}")
-    print(f"[run]    {args.count} frames @ {args.hz:.0f} Hz  (frame={FRAME_SIZE}B)\n")
+    # Forward UDP socket (laptop → ESP32)
+    udp_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    print(f"[udp-tx] sending to {ESP_IP}:{ESP_UDP_PORT}")
+
+    # Reverse UDP socket (ESP32 → laptop)
+    udp_rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_rx.bind(("", args.rev_port))
+    print(f"[udp-rx] listening on :{args.rev_port}")
+
+    print(f"[run]    {args.count} frames @ {args.hz:.0f} Hz  (frame={FRAME_SIZE}B)")
+    print(f"[run]    reverse channel @ {args.rev_hz:.0f} Hz\n")
 
     send_times  = []
     recv_times  = []
     stop_event  = threading.Event()
-    counters    = {"raw_bytes": 0, "crc_fail": 0}
+    counters    = {"raw_bytes": 0, "crc_fail": 0, "rev_sent": 0, "rev_recv": 0, "rev_crc_fail": 0}
 
+    # Thread 1: serial RX  (ESP32 → UART → Laptop)
     rx_thread = threading.Thread(target=serial_receiver,
                                  args=(ser, recv_times, send_times, stop_event, counters),
                                  daemon=True)
-    rx_thread.start()
+    # Thread 2: serial TX  (Laptop → UART → ESP32)
+    tx_rev_thread = threading.Thread(target=serial_sender,
+                                     args=(ser, stop_event, args.rev_hz, counters),
+                                     daemon=True)
+    # Thread 3: UDP RX     (ESP32 → WiFi/UDP → Laptop)
+    rx_rev_thread = threading.Thread(target=udp_receiver,
+                                     args=(udp_rx, stop_event, counters),
+                                     daemon=True)
 
-    # ── Send loop ────────────────────────────────────────────────────────────
+    rx_thread.start()
+    tx_rev_thread.start()
+    rx_rev_thread.start()
+
+    # ── Forward send loop (Laptop → WiFi → ESP32) ───────────────────────────
     for _ in range(args.count):
         frame = make_frame()
         send_times.append(time.perf_counter())
-        udp.sendto(frame, (ESP_IP, ESP_UDP_PORT))
+        udp_tx.sendto(frame, (ESP_IP, ESP_UDP_PORT))
         next_send = send_times[-1] + send_delay
         remaining = next_send - time.perf_counter()
         if remaining > 0.0005:
@@ -126,6 +215,8 @@ def main():
     time.sleep(0.5)
     stop_event.set()
     rx_thread.join(timeout=1.0)
+    tx_rev_thread.join(timeout=1.0)
+    rx_rev_thread.join(timeout=1.0)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     received = len(recv_times)
@@ -150,7 +241,16 @@ def main():
         print(f"  latency p95     : {p95:.2f}ms")
         print(f"  latency max     : {max(latencies):.2f}ms")
 
-    udp.close()
+    print(f"\n── Reverse channel {'─'*28}")
+    rev_s = counters['rev_sent']
+    rev_r = counters['rev_recv']
+    print(f"  rev frames sent : {rev_s}")
+    print(f"  rev frames recv : {rev_r}  (CRC OK)")
+    print(f"  rev CRC failures: {counters['rev_crc_fail']}")
+    print(f"  rev packet loss : {rev_s - rev_r}  ({100*(rev_s-rev_r)/max(rev_s,1):.1f}%)")
+
+    udp_tx.close()
+    udp_rx.close()
     ser.close()
 
 
