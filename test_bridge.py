@@ -30,7 +30,7 @@ REVERSE_UDP_PORT  = 4445          # Laptop listens here (reverse path)
 
 SEND_COUNT        = 250
 HZ                = 250
-REVERSE_HZ        = 10            # Reverse channel send rate
+REVERSE_HZ        = 50            # Reverse channel send rate
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -39,11 +39,11 @@ def make_frame() -> bytes:
                           quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
 
 
-# Reverse frame: 4-byte magic + 4-byte counter + 128-byte payload + 2-byte CRC-16
-# Total: 138 bytes  (1104 bits)
+# Reverse frame: 4-byte magic + 4-byte counter + 1024-byte payload + 2-byte CRC-16
+# Total: 1034 bytes — 56% of UART capacity at 50 Hz / 921600 baud
 _REV_MAGIC        = b"REV\xAA"
-REV_PAYLOAD_SIZE  = 128
-REV_FRAME_SIZE    = len(_REV_MAGIC) + 4 + REV_PAYLOAD_SIZE + 2  # 138
+REV_PAYLOAD_SIZE  = 1024
+REV_FRAME_SIZE    = len(_REV_MAGIC) + 4 + REV_PAYLOAD_SIZE + 2  # 1034
 
 def _crc16(data: bytes) -> int:
     crc = 0xFFFF
@@ -125,7 +125,7 @@ def udp_receiver(sock: socket.socket, stop_event: threading.Event, counters: dic
     while not stop_event.is_set():
         try:
             # Each recvfrom() returns exactly one datagram = one complete frame.
-            data, _ = sock.recvfrom(512)
+            data, _ = sock.recvfrom(2048)
             if len(data) < REV_FRAME_SIZE or data[:4] != _REV_MAGIC:
                 continue
             body, recv_crc = data[:REV_FRAME_SIZE - 2], struct.unpack("<H", data[REV_FRAME_SIZE - 2:REV_FRAME_SIZE])[0]
