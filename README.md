@@ -116,13 +116,13 @@ Defined in `pose_frame.py`. The ESP32 forwards all 21 bytes verbatim.
 
 Defined in `test_bridge.py` (`make_reverse_frame`).
 
-| Offset | Size | Field   | Type   | Encoding                               |
-|--------|------|---------|--------|----------------------------------------|
-| 0      | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
-| 4      | 4    | counter | uint32 | little-endian, increments each frame   |
-| 8      | 128  | payload | bytes  | counter repeated as uint32 LE (test pattern) |
-| 136    | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..135] |
-| **138**|      |         |        |                                        |
+| Offset  | Size | Field   | Type   | Encoding                               |
+|---------|------|---------|--------|----------------------------------------|
+| 0       | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
+| 4       | 4    | counter | uint32 | little-endian, increments each frame   |
+| 8       | 1024 | payload | bytes  | counter repeated as uint32 LE (test pattern) |
+| 136     | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..135] |
+| **1034**|     |         |        |                                        |
 
 The receiver searches for the magic bytes and validates the CRC on every frame.
 Bad frames increment `rev_crc_fail` rather than `rev_recv`.
