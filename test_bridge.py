@@ -55,7 +55,7 @@ def _crc16(data: bytes) -> int:
     return crc
 
 def make_reverse_frame(counter: int) -> bytes:
-    # 128-byte payload: counter repeated as uint32 LE to fill the space
+    # 1024-byte payload: counter repeated as uint32 LE to fill the space
     payload = (struct.pack("<I", counter & 0xFFFFFFFF) * (REV_PAYLOAD_SIZE // 4))
     body = _REV_MAGIC + struct.pack("<I", counter & 0xFFFFFFFF) + payload
     return body + struct.pack("<H", _crc16(body))

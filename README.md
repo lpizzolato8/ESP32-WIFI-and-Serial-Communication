@@ -112,7 +112,7 @@ Defined in `pose_frame.py`. The ESP32 forwards all 21 bytes verbatim.
 | 19     | 2    | crc16  | uint16 | CRC-16/CCITT-FALSE over bytes [0..18] |
 | **21** |      |        |        |                                       |
 
-### Reverse frame (laptop → ESP32 → UDP) — 138 bytes
+### Reverse frame (laptop → ESP32 → UDP) — 1034 bytes
 
 Defined in `test_bridge.py` (`make_reverse_frame`).
 
@@ -121,7 +121,7 @@ Defined in `test_bridge.py` (`make_reverse_frame`).
 | 0       | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
 | 4       | 4    | counter | uint32 | little-endian, increments each frame   |
 | 8       | 1024 | payload | bytes  | counter repeated as uint32 LE (test pattern) |
-| 136     | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..135] |
+| 1032    | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..1031] |
 | **1034**|     |         |        |                                        |
 
 The receiver searches for the magic bytes and validates the CRC on every frame.
@@ -275,8 +275,8 @@ Sample output:
 
   frame     1  latency=5.81ms  pos=(1.0000, 2.0000, 3.0000)
   ...
-[rev-udp] frame      0  138B  CRC OK
-[rev-udp] frame      1  138B  CRC OK
+[rev-udp] frame      0 1034B  CRC OK
+[rev-udp] frame      1 1034B  CRC OK
   ...
 ── Results ────────────────────────────────────────────────────────────────
   frames sent     : 250
@@ -322,7 +322,7 @@ python3 read_serial.py
 | --baud      | 921600       | Must match firmware                |
 | --hz        | 250          | Forward send rate                  |
 | --count     | 250          | Number of forward frames to send   |
-| --rev-hz    | 10           | Reverse send rate                  |
+| --rev-hz    | 50           | Reverse send rate                  |
 | --rev-port  | 4445         | UDP port to receive reverse frames |
 
 ### main/wifi_ap.c
