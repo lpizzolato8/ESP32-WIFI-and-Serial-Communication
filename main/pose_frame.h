@@ -1,37 +1,40 @@
 #pragma once
 #include <stdint.h>
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * pose_frame.h  –  Binary frame definition
+ * pose_frame.h  –  Binary frame definition (must match pose_frame.py)
  *
- * Total: 20 bytes
+ * Total: 21 bytes, all fields little-endian
  *
  *  Offset  Size  Field
  *  ──────  ────  ──────────────────────────────────────────────────────
- *   0      1     header   – magic byte 0xA5
- *   1      3     pos_x    – int24, signed, scale ÷10000 → metres (0.1mm res)
- *   4      3     pos_y    – int24, signed, scale ÷10000 → metres
- *   7      3     pos_z    – int24, signed, scale ÷10000 → metres
- *  10      2     quat_w   – int16, signed, scale ÷32767 → [-1, 1]
- *  12      2     quat_x   – int16, signed, scale ÷32767
- *  14      2     quat_y   – int16, signed, scale ÷32767
- *  16      2     quat_z   – int16, signed, scale ÷32767
- *  18      2     crc16    – CRC-16/CCITT-FALSE over bytes [0..17], little-endian
+ *   0      2     magic    – uint16 0xABCD (bytes CD AB on the wire)
+ *   2      3     pos_x    – int24, signed, scale ÷10000 → metres (0.1mm res)
+ *   5      3     pos_y    – int24, signed, scale ÷10000 → metres
+ *   8      3     pos_z    – int24, signed, scale ÷10000 → metres
+ *  11      2     quat_w   – int16, signed, scale ÷32767 → [-1, 1]
+ *  13      2     quat_x   – int16, signed, scale ÷32767
+ *  15      2     quat_y   – int16, signed, scale ÷32767
+ *  17      2     quat_z   – int16, signed, scale ÷32767
+ *  19      2     crc16    – CRC-16/CCITT-FALSE over bytes [0..18]
  *  ──────  ────
- *  20      total
+ *  21      total
  *
  * Encoding helpers
  * ─────────────────
- *  Position  :  raw = (int32_t)round(metres * 10000.0f)   range ±999,000 → fits int24
- *  Quaternion:  raw = (int16_t)round(component * 32767.0f) range ±1.0    → fits int16
+ *  Position  :  raw = (int32_t)lroundf(metres * 10000.0f)    range ±838.86 m
+ *  Quaternion:  raw = (int16_t)lroundf(component * 32767.0f) range ±1.0
+ *
+ * The struct relies on a little-endian target (ESP32, STM32).
  */
 
-#define FRAME_HEADER      0xA5u
-#define FRAME_SIZE        20u
+#define FRAME_MAGIC       0xABCDu
+#define FRAME_SIZE        21u
 
 #define POS_SCALE         10000.0f   /* raw = metres × 10000  (0.1 mm / LSB) */
 #define QUAT_SCALE        32767.0f   /* raw = component × 32767              */
@@ -40,7 +43,7 @@ extern "C" {
 
 #pragma pack(push, 1)
 typedef struct {
-    uint8_t  header;           /*  1 byte  – must be FRAME_HEADER            */
+    uint16_t magic;            /*  2 bytes – must be FRAME_MAGIC             */
     uint8_t  pos_x[3];         /*  3 bytes – int24 little-endian             */
     uint8_t  pos_y[3];
     uint8_t  pos_z[3];
@@ -49,7 +52,13 @@ typedef struct {
     int16_t  quat_y;
     int16_t  quat_z;
     uint16_t crc16;            /*  2 bytes – CRC-16/CCITT-FALSE, LE          */
-} pose_frame_t;                /* 20 bytes total                             */
+} pose_frame_t;                /* 21 bytes total                             */
+
+#ifdef __cplusplus
+static_assert(sizeof(pose_frame_t) == FRAME_SIZE, "pose_frame_t must be 21 bytes");
+#else
+_Static_assert(sizeof(pose_frame_t) == FRAME_SIZE, "pose_frame_t must be 21 bytes");
+#endif
 #pragma pack(pop)
 
 /* ── int24 helpers ──────────────────────────────────────────────────────── */
@@ -93,31 +102,32 @@ static inline uint16_t crc16_ccitt(const uint8_t *data, uint16_t len)
  * @brief  Fill a pose_frame_t from float inputs and append CRC.
  *
  * @param  f      Output frame (must point to valid memory)
- * @param  x,y,z  Position in metres  (range ±99.9 m, 0.1 mm resolution)
+ * @param  x,y,z  Position in metres  (range ±838.86 m, 0.1 mm resolution)
  * @param  w,qx,qy,qz  Unit quaternion components (range [-1, 1])
  */
 static inline void pose_frame_build(pose_frame_t *f,
                                     float x,  float y,  float z,
                                     float w,  float qx, float qy, float qz)
 {
-    f->header = FRAME_HEADER;
-    int24_encode(f->pos_x, (int32_t)(x  * POS_SCALE));
-    int24_encode(f->pos_y, (int32_t)(y  * POS_SCALE));
-    int24_encode(f->pos_z, (int32_t)(z  * POS_SCALE));
-    f->quat_w = (int16_t)(w  * QUAT_SCALE);
-    f->quat_x = (int16_t)(qx * QUAT_SCALE);
-    f->quat_y = (int16_t)(qy * QUAT_SCALE);
-    f->quat_z = (int16_t)(qz * QUAT_SCALE);
+    f->magic  = FRAME_MAGIC;
+    /* Round (not truncate) to match pose_frame.py. */
+    int24_encode(f->pos_x, (int32_t)lroundf(x  * POS_SCALE));
+    int24_encode(f->pos_y, (int32_t)lroundf(y  * POS_SCALE));
+    int24_encode(f->pos_z, (int32_t)lroundf(z  * POS_SCALE));
+    f->quat_w = (int16_t)lroundf(w  * QUAT_SCALE);
+    f->quat_x = (int16_t)lroundf(qx * QUAT_SCALE);
+    f->quat_y = (int16_t)lroundf(qy * QUAT_SCALE);
+    f->quat_z = (int16_t)lroundf(qz * QUAT_SCALE);
     f->crc16  = crc16_ccitt((const uint8_t *)f, FRAME_SIZE - 2);
 }
 
 /**
- * @brief  Validate header magic and CRC of a received frame.
+ * @brief  Validate magic and CRC of a received frame.
  * @return 1 if valid, 0 if not.
  */
 static inline int pose_frame_validate(const pose_frame_t *f)
 {
-    if (f->header != FRAME_HEADER) return 0;
+    if (f->magic != FRAME_MAGIC) return 0;
     uint16_t expected = crc16_ccitt((const uint8_t *)f, FRAME_SIZE - 2);
     return (f->crc16 == expected) ? 1 : 0;
 }
