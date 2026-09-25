@@ -13,7 +13,7 @@ Usage:
 Dependencies:
     pip install pyserial
 """
-from pose_frame import PoseFrame, FRAME_SIZE, MAGIC_BYTES
+from pose_frame import PoseFrame, FRAME_SIZE, MAGIC_BYTES, POS_SCALE
 import argparse
 import socket
 import serial
@@ -34,9 +34,15 @@ REVERSE_HZ        = 50            # Reverse channel send rate
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def make_frame() -> bytes:
-    return PoseFrame.pack(pos_x=1.0, pos_y=2.0, pos_z=3.0,
+def make_frame(seq: int) -> bytes:
+    # pos_x carries the sequence number (one 0.1 mm step per frame) so each
+    # received frame can be matched to its own send time, even after a loss.
+    return PoseFrame.pack(pos_x=seq / POS_SCALE, pos_y=2.0, pos_z=3.0,
                           quat_w=1.0, quat_x=0.0, quat_y=0.0, quat_z=0.0)
+
+
+def frame_seq(parsed: dict) -> int:
+    return round(parsed["pos"][0] * POS_SCALE)
 
 
 # Reverse frame: 4-byte magic + 4-byte counter + 1024-byte payload + 2-byte CRC-16
@@ -63,7 +69,7 @@ def make_reverse_frame(counter: int) -> bytes:
 
 # ── Forward serial receiver (ESP32 → UART → Laptop) ─────────────────────────
 
-def serial_receiver(ser, recv_times: list, send_times: list,
+def serial_receiver(ser, received: dict, send_times: list,
                     stop_event: threading.Event, counters: dict):
     buf = b""
     dumped = False
@@ -86,18 +92,33 @@ def serial_receiver(ser, recv_times: list, send_times: list,
             try:
                 parsed = PoseFrame.unpack(buf[:FRAME_SIZE])
                 t_recv = time.perf_counter()
-                recv_times.append(t_recv)
-                n = len(recv_times)
-                if n <= len(send_times):
-                    latency_ms = (t_recv - send_times[n - 1]) * 1000
+                seq = frame_seq(parsed)
+                if 0 <= seq < len(send_times) and seq not in received:
+                    received[seq] = t_recv
+                    latency_ms = (t_recv - send_times[seq]) * 1000
                     p = parsed["pos"]
-                    print(f"  frame {n:>5}  latency={latency_ms:.2f}ms  "
+                    print(f"  frame {seq:>5}  latency={latency_ms:.2f}ms  "
                           f"pos=({p[0]:.4f}, {p[1]:.4f}, {p[2]:.4f})")
                 buf = buf[FRAME_SIZE:]
             except ValueError:
                 counters["crc_fail"] += 1
                 buf = buf[1:]
     print(f"[serial] raw bytes received: {counters['raw_bytes']}")
+
+
+# ── Ack receiver (ESP32 → WiFi/UDP → Laptop) ─────────────────────────────────
+
+def ack_receiver(sock: socket.socket, ack_times: list, stop_event: threading.Event):
+    # The ESP32 replies 0xAC to each forward datagram before its UART write,
+    # so send → ack is the WiFi round trip without the UART leg.
+    sock.settimeout(0.1)
+    while not stop_event.is_set():
+        try:
+            data, _ = sock.recvfrom(16)
+            if data == b"\xAC":
+                ack_times.append(time.perf_counter())
+        except socket.timeout:
+            pass
 
 
 # ── Reverse serial sender (Laptop → UART → ESP32) ───────────────────────────
@@ -149,7 +170,7 @@ def main():
     parser.add_argument("--hz",         default=HZ, type=float,    help="Forward send rate in Hz")
     parser.add_argument("--rev-hz",     default=REVERSE_HZ, type=float, help="Reverse send rate in Hz")
     parser.add_argument("--rev-port",   default=REVERSE_UDP_PORT, type=int,
-                        help="ESP32 TCP port for reverse data (default 4445)")
+                        help="Laptop UDP port for reverse data (default 4445)")
     args = parser.parse_args()
 
     send_delay = 1.0 / args.hz
@@ -179,13 +200,14 @@ def main():
     print(f"[run]    reverse channel @ {args.rev_hz:.0f} Hz\n")
 
     send_times  = []
-    recv_times  = []
+    received    = {}   # seq → receive time
+    ack_times   = []
     stop_event  = threading.Event()
     counters    = {"raw_bytes": 0, "crc_fail": 0, "rev_sent": 0, "rev_recv": 0, "rev_crc_fail": 0}
 
     # Thread 1: serial RX  (ESP32 → UART → Laptop)
     rx_thread = threading.Thread(target=serial_receiver,
-                                 args=(ser, recv_times, send_times, stop_event, counters),
+                                 args=(ser, received, send_times, stop_event, counters),
                                  daemon=True)
     # Thread 2: serial TX  (Laptop → UART → ESP32)
     tx_rev_thread = threading.Thread(target=serial_sender,
@@ -196,13 +218,19 @@ def main():
                                      args=(udp_rx, stop_event, counters),
                                      daemon=True)
 
+    # Thread 4: UDP ack RX (ESP32 → WiFi/UDP → Laptop)
+    ack_thread = threading.Thread(target=ack_receiver,
+                                  args=(udp_tx, ack_times, stop_event),
+                                  daemon=True)
+
     rx_thread.start()
     tx_rev_thread.start()
     rx_rev_thread.start()
+    ack_thread.start()
 
     # ── Forward send loop (Laptop → WiFi → ESP32) ───────────────────────────
-    for _ in range(args.count):
-        frame = make_frame()
+    for seq in range(args.count):
+        frame = make_frame(seq)
         send_times.append(time.perf_counter())
         udp_tx.sendto(frame, (ESP_IP, ESP_UDP_PORT))
         next_send = send_times[-1] + send_delay
@@ -217,17 +245,17 @@ def main():
     rx_thread.join(timeout=1.0)
     tx_rev_thread.join(timeout=1.0)
     rx_rev_thread.join(timeout=1.0)
+    ack_thread.join(timeout=1.0)
 
     # ── Summary ──────────────────────────────────────────────────────────────
-    received = len(recv_times)
-    lost     = args.count - received
+    n_recv = len(received)
+    lost   = args.count - n_recv
 
-    latencies = [(recv_times[i] - send_times[i]) * 1000
-                 for i in range(min(received, args.count))]
+    latencies = [(t - send_times[seq]) * 1000 for seq, t in received.items()]
 
     print(f"── Results {'─'*36}")
     print(f"  frames sent     : {args.count}")
-    print(f"  frames received : {received}  (CRC OK)")
+    print(f"  frames received : {n_recv}  (CRC OK)")
     print(f"  CRC failures    : {counters['crc_fail']}")
     print(f"  never arrived   : {lost - counters['crc_fail']}  (lost in WiFi/UART)")
     print(f"  packet loss     : {lost}  ({100*lost/args.count:.1f}%)")
@@ -240,6 +268,21 @@ def main():
         print(f"  latency min     : {min(latencies):.2f}ms")
         print(f"  latency p95     : {p95:.2f}ms")
         print(f"  latency max     : {max(latencies):.2f}ms")
+
+    # Acks carry no sequence number, so they are paired with sends by order.
+    # That is only valid when every ack arrived.
+    print(f"\n── WiFi round trip (ack) {'─'*22}")
+    print(f"  acks received   : {len(ack_times)} / {args.count}")
+    if ack_times and len(ack_times) == args.count:
+        rtts = sorted((ack_times[i] - send_times[i]) * 1000 for i in range(args.count))
+        rtt_avg = sum(rtts) / len(rtts)
+        print(f"  wifi rtt avg    : {rtt_avg:.2f}ms")
+        print(f"  wifi rtt p95    : {rtts[int(len(rtts) * 0.95)]:.2f}ms")
+        if latencies:
+            print(f"  est. split      : wifi ≈ {rtt_avg / 2:.2f}ms one-way, "
+                  f"esp32+uart+usb ≈ {avg - rtt_avg / 2:.2f}ms")
+    elif ack_times:
+        print("  some acks lost; skipping rtt (acks are paired by order)")
 
     print(f"\n── Reverse channel {'─'*28}")
     rev_s = counters['rev_sent']

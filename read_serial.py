@@ -2,7 +2,7 @@ import serial
 from pose_frame import PoseFrame, FRAME_SIZE, MAGIC_BYTES
 
 PORT = "/dev/ttyUSB0"    # CP2102 → frame data (IDF console is on /dev/ttyACM0)
-BAUD = 115200
+BAUD = 921600
 
 s = serial.Serial(PORT, BAUD, timeout=0.05)
 print(f"Listening on {PORT} @ {BAUD} baud  (frame={FRAME_SIZE}B)...")

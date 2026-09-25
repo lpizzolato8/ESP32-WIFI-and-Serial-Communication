@@ -31,7 +31,7 @@ CP2102 USB-serial adapter and received on `/dev/ttyUSB0`.
 **Reverse path:** The Linux laptop writes reverse frames to the serial port
 (`/dev/ttyUSB0` → CP2102 → GPIO18). The ESP32 reads them from UART1 RX and
 sends them as UDP datagrams to the laptop on port `4445`. The laptop's IP is
-learned automatically from the first forward UDP packet received — no
+learned automatically from forward UDP packets, and updated if it changes — no
 hardcoding needed.
 
 All four paths (UDP TX, serial RX, serial TX, UDP RX) run simultaneously on
@@ -134,8 +134,7 @@ Bad frames increment `rev_crc_fail` rather than `rev_recv`.
 ```
 ESP32Communication/
 ├── CMakeLists.txt           # Top-level ESP-IDF project file
-├── sdkconfig.defaults       # N16R8 flash/PSRAM + WiFi config
-├── partitions.csv           # Custom 16 MB partition table
+├── sdkconfig.defaults       # Target + 16 MB flash size
 ├── pose_frame.py            # Python frame pack/unpack with CRC
 ├── test_bridge.py           # Bidirectional bridge test (4 threads)
 ├── read_serial.py           # Serial monitor with magic re-sync
@@ -147,7 +146,7 @@ ESP32Communication/
     ├── wifi_ap.h
     ├── udp_uart_bridge.c    # Bidirectional UDP↔UART bridge (2 tasks)
     ├── udp_uart_bridge.h
-    └── pose_frame.h         # Compact binary frame struct for STM32
+    └── pose_frame.h         # 21-byte frame struct + CRC for the STM32 side
 ```
 
 ---
@@ -251,7 +250,7 @@ ping 192.168.4.1
 
 ### Step 2 — run the bridge test
 
-`test_bridge.py` runs four threads simultaneously:
+`test_bridge.py` runs the forward send loop plus four threads simultaneously:
 
 | Thread | Direction | Transport |
 |--------|-----------|-----------|
@@ -259,12 +258,19 @@ ping 192.168.4.1
 | `serial_receiver` | ESP32 → Laptop | UART → `/dev/ttyUSB0` |
 | `serial_sender`   | Laptop → ESP32 | `/dev/ttyUSB0` → UART |
 | `udp_receiver`    | ESP32 → Laptop | UDP port 4445 |
+| `ack_receiver`    | ESP32 → Laptop | 1-byte UDP ack per forward frame |
+
+Each forward frame carries its sequence number in `pos_x` (one 0.1 mm step per
+frame), so latency is matched to the right send even if frames are lost. The
+ESP32's ack arrives before the UART write, so send → ack is the WiFi round trip
+on its own.
 
 ```bash
 python3 test_bridge.py --port /dev/ttyUSB0 --baud 921600
 ```
 
-Sample output:
+Sample output (from an earlier run with the reverse channel at 10 Hz, before
+the ack section and sequence numbers were added; rerun to refresh):
 
 ```
 [serial] opened /dev/ttyUSB0 @ 921600 baud
