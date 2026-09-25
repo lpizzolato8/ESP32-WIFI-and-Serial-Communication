@@ -6,7 +6,7 @@
  *
  * Reverse  (Task 2 – uart_udp_task):
  *   Laptop serial TX → UART RX (GPIO18) → ESP32 UDP → laptop port 4445
- *   Laptop IP is learned from the first forward UDP packet received.
+ *   Laptop IP is learned from forward UDP packets and updated if it changes.
  *
  * UART pinout:
  *   GPIO17 → CP2102 RX  (UART TX, forward path)
@@ -45,8 +45,10 @@
 
 static const char *TAG = "udp_uart";
 
-/* Laptop address learned from the first forward UDP packet. */
-static volatile bool      s_client_valid = false;
+/* Laptop address learned from forward UDP packets. Written by bridge_task,
+ * read by uart_udp_task; s_client_lock keeps the struct copy consistent. */
+static portMUX_TYPE       s_client_lock  = portMUX_INITIALIZER_UNLOCKED;
+static bool               s_client_valid = false;
 static struct sockaddr_in s_client_addr  = {0};
 
 static void uart_init(void)
@@ -120,11 +122,19 @@ static void bridge_task(void *arg)
             continue;
         }
 
-        /* Learn the laptop's address for the reverse UDP path. */
-        if (!s_client_valid) {
-            s_client_addr       = src;
+        /* Learn the laptop's address for the reverse UDP path, and follow it
+         * if the laptop reconnects with a different IP. */
+        bool changed = false;
+        taskENTER_CRITICAL(&s_client_lock);
+        if (!s_client_valid ||
+            s_client_addr.sin_addr.s_addr != src.sin_addr.s_addr) {
+            s_client_addr          = src;
             s_client_addr.sin_port = htons(REVERSE_UDP_PORT);
-            s_client_valid      = true;
+            s_client_valid         = true;
+            changed                = true;
+        }
+        taskEXIT_CRITICAL(&s_client_lock);
+        if (changed) {
             char ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));
             ESP_LOGI(TAG, "Learned client address: %s → reverse UDP to :%d", ip, REVERSE_UDP_PORT);
@@ -176,7 +186,14 @@ static void uart_udp_task(void *arg)
     ESP_LOGI(TAG, "Reverse UDP task started, waiting for client address");
 
     while (1) {
-        if (!s_client_valid) {
+        struct sockaddr_in dest;
+        bool valid;
+        taskENTER_CRITICAL(&s_client_lock);
+        valid = s_client_valid;
+        dest  = s_client_addr;
+        taskEXIT_CRITICAL(&s_client_lock);
+
+        if (!valid) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -186,26 +203,34 @@ static void uart_udp_task(void *arg)
         if (len <= 0) continue;
         filled += len;
 
-        /* Scan forward until buf starts with the magic bytes, discarding
-         * any partial/misaligned data from joining mid-frame.             */
-        while (filled >= 4 &&
-               memcmp(buf, REV_MAGIC, 4) != 0) {
-            memmove(buf, buf + 1, --filled);
+        /* Send every complete frame in the buffer, not just the first. */
+        while (1) {
+            /* Find the first magic and discard everything before it
+             * (partial/misaligned data from joining mid-frame). If there is
+             * no magic, keep the last 3 bytes in case one starts there.   */
+            int start = 0;
+            while (start + 4 <= filled && memcmp(buf + start, REV_MAGIC, 4) != 0) {
+                start++;
+            }
+            if (start > 0) {
+                filled -= start;
+                memmove(buf, buf + start, filled);
+            }
+
+            if (filled < REV_FRAME_SIZE) break;
+
+            int sent = sendto(sock, buf, REV_FRAME_SIZE, 0,
+                              (struct sockaddr *)&dest, sizeof(dest));
+            if (sent < 0) {
+                ESP_LOGW(TAG, "Reverse UDP sendto failed: errno %d", errno);
+            } else {
+                ESP_LOGD(TAG, "Reverse: %d bytes UART → UDP", sent);
+            }
+
+            /* Shift any leftover bytes (start of next frame) to the front. */
+            filled -= REV_FRAME_SIZE;
+            if (filled > 0) memmove(buf, buf + REV_FRAME_SIZE, filled);
         }
-
-        if (filled < REV_FRAME_SIZE) continue;
-
-        int sent = sendto(sock, buf, REV_FRAME_SIZE, 0,
-                          (struct sockaddr *)&s_client_addr, sizeof(s_client_addr));
-        if (sent < 0) {
-            ESP_LOGW(TAG, "Reverse UDP sendto failed: errno %d", errno);
-        } else {
-            ESP_LOGD(TAG, "Reverse: %d bytes UART → UDP", sent);
-        }
-
-        /* Shift any leftover bytes (start of next frame) to the front. */
-        filled -= REV_FRAME_SIZE;
-        if (filled > 0) memmove(buf, buf + REV_FRAME_SIZE, filled);
     }
 
     close(sock);

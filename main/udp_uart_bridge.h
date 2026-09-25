@@ -5,10 +5,10 @@ extern "C" {
 #endif
 
 /**
- * @brief  Start the UDP → UART bridge in a background FreeRTOS task.
+ * @brief  Start the bidirectional bridge (two background FreeRTOS tasks).
  *
- * Listens on BRIDGE_UDP_PORT (default 4444).
- * Every UDP datagram received is written verbatim to UART (no parsing).
+ * Forward: UDP port 4444 → UART TX. Reverse: UART RX → UDP port 4445.
+ * Forward datagrams are written verbatim to UART (no parsing).
  *
  * Call after wifi_ap_init().
  */
