@@ -1,0 +1,59 @@
+NEXT STEPS - ESP32-S3 WiFi-UART bridge + STM32F405 receiver
+============================================================
+Updated 2026-10-06. Nothing below has been run on hardware yet.
+
+STAGE 1: ESP32 + CP2102 only (verify the Sep 25 fixes)
+------------------------------------------------------
+  1. idf.py -p /dev/ttyACM0 flash monitor
+     - Confirm it boots and the log shows the 16 MB flash size.
+  2. nmcli dev wifi connect "ESP32S3-Hotspot" password ... ifname wlan0
+  3. python3 test_bridge.py --port /dev/ttyUSB0 --baud 921600
+     - Forward: 250/250 frames, note latency avg / p95.
+     - "WiFi round trip (ack)" should show 250/250 acks.
+     - Reverse at 50 Hz, 1034 B: note sent / received / CRC failures.
+  4. Reconnect the laptop to the hotspot; the ESP32 log should show
+     "Learned client address" again and reverse frames should still arrive.
+  5. Paste the output into the README "Sample output" block.
+
+STAGE 2: STM32F405 on the ESP32 UART
+------------------------------------
+  1. Find the board's UART1 pads (PA9 TX / PA10 RX). If UART1 isn't
+     broken out, switch to USART3 or USART6 in stm32/src/board.h.
+  2. Flash: hold BOOT, plug in USB, then
+       cmake --build stm32/build --target flash
+     (sudo or a udev rule for 0483:df11 if dfu-util can't open it)
+  3. Wire: ESP32 GPIO17 -> STM32 RX (and CP2102 RX), STM32 TX -> ESP32
+     GPIO18, GND -> GND. Disconnect the CP2102 TX.
+  4. python3 test_bridge.py --stm32 --port /dev/ttyUSB0
+     - "poses validated" should be 250 / 250, CRC + UART errors 0.
+     - "failsafe drops" 0. "last pose seq" 249.
+     - If no status frames arrive in 2 s: check STM32 TX -> GPIO18, and
+       that the board is out of DFU mode (replug without BOOT).
+  5. Pull the GPIO17 wire mid-run: failsafe drops should go up.
+  6. Optional: set HAS_LED + the LED pin in board.h for a visual failsafe.
+
+
+IDEAS, roughly by payoff
+------------------------
+1. True end-to-end latency through the STM32
+   - Status frames carry the last pose, but go out every 20 ms, so they
+     can't time a single frame. Add a small "echo" reply sent as soon as a
+     pose arrives (needs a short reverse frame type on the ESP32 side).
+
+2. Find the cause of the ~20 ms latency spikes
+   - The ack timing separates WiFi time from ESP32 + UART + USB time.
+   - If it's WiFi: esp_wifi_set_ps(WIFI_PS_NONE) on the ESP32,
+     iw dev wlan0 set power_save off on the laptop, try a quieter channel.
+   - Goal: < 10 ms for attitude stabilisation. Record before/after.
+
+3. Long test run + latency histogram
+   - 5-10 minutes instead of 250 frames; save per-frame latencies to CSV
+     and plot percentiles. Good for a resume or interview.
+
+4. CI
+   - GitHub Actions: pytest (stm32/test), the STM32 CMake build, and an
+     ESP-IDF build (espressif/idf image).
+
+5. Change settings without reflashing
+   - SSID, password, channel and baud in NVS, changed over UDP or console.
+     Also gets the hotspot password out of the source and README.
