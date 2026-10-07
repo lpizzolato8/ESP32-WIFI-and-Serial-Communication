@@ -66,14 +66,8 @@ separate threads in `test_bridge.py`.
 The rule is always **TX → RX, RX → TX** (crossed). GPIO17 is the ESP32's
 transmit pin; it connects to the CP2102's receive pin, and vice versa.
 
-**Future STM32 setup** — same pins, just connect to the STM32 instead of the
-CP2102. No firmware change needed.
-
-| ESP32 Pin | Connects to | Purpose          |
-|-----------|-------------|------------------|
-| GPIO17    | STM32 RX    | UART1 data out   |
-| GPIO18    | STM32 TX    | UART1 data in    |
-| GND       | STM32 GND   | Common ground    |
+**STM32 setup** — same ESP32 pins and no ESP32 firmware change. See
+[STM32F405 receiver](#stm32f405-receiver) below.
 
 ---
 
@@ -139,6 +133,17 @@ ESP32Communication/
 ├── test_bridge.py           # Bidirectional bridge test (4 threads)
 ├── read_serial.py           # Serial monitor with magic re-sync
 ├── test_send.py             # Minimal send-only test (no serial)
+├── stm32/                   # STM32F405 receiver firmware (CMake + HAL)
+│   ├── CMakeLists.txt
+│   ├── STM32F405RG.ld       # Linker script
+│   ├── cmake/               # arm-none-eabi toolchain file
+│   ├── lib/                 # ST HAL + CMSIS (git submodules)
+│   ├── src/
+│   │   ├── board.h          # UART pins, clock source, LED — edit for your board
+│   │   ├── main.c           # Clock, UART DMA, main loop
+│   │   ├── pose_rx.c/.h     # Frame parser, failsafe, status frame (no HAL)
+│   │   └── stm32f4xx_it.c   # Interrupt handlers
+│   └── test/test_pose_rx.py # Host tests for pose_rx.c (pytest)
 └── main/
     ├── CMakeLists.txt       # Component registration (IDF 6.1+)
     ├── main.c               # app_main boot sequence
@@ -308,6 +313,60 @@ python3 read_serial.py
 
 ---
 
+## STM32F405 receiver
+
+`stm32/` is firmware for an STM32F405 that sits on the ESP32's UART in place
+of the CP2102. It:
+
+- receives pose frames with circular DMA, re-syncs on `0xABCD` and checks the CRC
+- enters **failsafe** if no valid pose arrives for 100 ms (where a flight
+  controller would hold position or land)
+- sends a 1034-byte reverse frame every 20 ms whose payload starts with a
+  status block (`STM1`, frames OK, CRC failures, bytes skipped, UART errors,
+  failsafe state and count, last pose), so the laptop can see what the STM32
+  actually received
+
+### Wiring
+
+| ESP32 pin | STM32 (default: USART1) | Purpose                         |
+|-----------|-------------------------|---------------------------------|
+| GPIO17    | PA10 (RX1)              | Pose frames, ESP32 → STM32      |
+| GPIO18    | PA9 (TX1)               | Status frames, STM32 → ESP32    |
+| GND       | GND                     | Common ground                   |
+
+Leaving the CP2102 RX also on GPIO17 (one TX can drive both) keeps the
+forward latency measurement working. Disconnect the CP2102 TX so it doesn't
+fight the STM32 on GPIO18. Using another UART, the clock source or an LED is
+set in `stm32/src/board.h`.
+
+### Build and flash
+
+```bash
+git submodule update --init --depth 1     # ST HAL + CMSIS, first time only
+cmake -S stm32 -B stm32/build -G Ninja
+cmake --build stm32/build
+
+# Hold BOOT while plugging in USB (ROM DFU bootloader, 0483:df11), then:
+cmake --build stm32/build --target flash
+```
+
+The toolchain file finds `arm-none-eabi-gcc` on `PATH` or in
+`~/tools/arm-gnu-toolchain-*/bin`. If `dfu-util` can't open the device,
+run it with `sudo` or add a udev rule for `0483:df11`.
+
+### Test
+
+```bash
+python3 -m pytest stm32/test                      # parser tests, no hardware
+python3 test_bridge.py --stm32 --port /dev/ttyUSB0   # or --port none
+```
+
+With `--stm32` the laptop doesn't send reverse frames; it reads the STM32's
+status frames and prints how many poses the STM32 validated, its CRC and UART
+errors, and any failsafe dropouts during the run.
+
+---
+
 ## Tunable parameters
 
 ### main/udp_uart_bridge.c
@@ -324,12 +383,13 @@ python3 read_serial.py
 
 | Argument    | Default      | Description                        |
 |-------------|--------------|------------------------------------|
-| --port      | /dev/ttyUSB0 | Serial port                        |
+| --port      | /dev/ttyUSB0 | Serial port, or `none`             |
 | --baud      | 921600       | Must match firmware                |
 | --hz        | 250          | Forward send rate                  |
 | --count     | 250          | Number of forward frames to send   |
 | --rev-hz    | 50           | Reverse send rate                  |
 | --rev-port  | 4445         | UDP port to receive reverse frames |
+| --stm32     | off          | Read STM32 status frames instead of sending reverse frames |
 
 ### main/wifi_ap.c
 
