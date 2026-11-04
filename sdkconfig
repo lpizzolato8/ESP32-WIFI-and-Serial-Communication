@@ -1364,8 +1364,7 @@ CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
 #
 # ESP-Driver:UART Configurations
 #
-# default:
-# CONFIG_UART_ISR_IN_IRAM is not set
+CONFIG_UART_ISR_IN_IRAM=y
 # end of ESP-Driver:UART Configurations
 
 #
@@ -3718,7 +3717,7 @@ CONFIG_VFS_SUPPORT_SELECT=y
 # default:
 CONFIG_VFS_SUPPRESS_SELECT_DEBUG_OUTPUT=y
 # default:
-# CONFIG_VFS_SELECT_IN_RAM is not set
+CONFIG_VFS_SELECT_IN_RAM=y
 # default:
 # CONFIG_VFS_SUPPORT_TERMIOS is not set
 # default:

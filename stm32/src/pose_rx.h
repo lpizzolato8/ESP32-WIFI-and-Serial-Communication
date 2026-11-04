@@ -9,10 +9,11 @@
 #include <stdint.h>
 #include "pose_frame.h"
 
-/* Reverse frame (must match test_bridge.py):
- *   4 magic "REV\xAA" | 4 counter | 1024 payload | 2 CRC-16 = 1034 bytes  */
-#define REV_PAYLOAD_SIZE  1024u
-#define REV_FRAME_SIZE    (4u + 4u + REV_PAYLOAD_SIZE + 2u)
+/* Frames sent to the ESP32 (relayed to the laptop; must match test_bridge.py
+ * and main/udp_uart_bridge.c). Both are short so one can't hold the UART TX
+ * line long enough to delay the other noticeably (67 B = 0.7 ms at 921600):
+ *   status: "STM\xAA" | 4 counter | 57 pose_rx_status_t | 2 CRC-16 = 67 B
+ *   echo  : "ECH\xAA" | 21 pose frame                    | 2 CRC-16 = 27 B  */
 
 #define FAILSAFE_TIMEOUT_MS 100u   /* no valid pose for this long → failsafe */
 
@@ -35,6 +36,9 @@ typedef struct {
 #pragma pack(pop)
 _Static_assert(sizeof(pose_rx_status_t) == 57, "status must be 57 bytes");
 
+#define STATUS_FRAME_SIZE (4u + 4u + sizeof(pose_rx_status_t) + 2u)   /* 67 */
+#define ECHO_FRAME_SIZE   (4u + FRAME_SIZE + 2u)                      /* 27 */
+
 /** Feed one received UART byte. */
 void pose_rx_feed(uint8_t b, uint32_t now_ms);
 
@@ -46,8 +50,13 @@ void pose_rx_count_uart_error(void);
 /** Update the failsafe flag; call often. Returns 1 while in failsafe. */
 int pose_rx_tick(uint32_t now_ms);
 
-/** Write a REV_FRAME_SIZE status frame into out. */
-void pose_rx_build_status(uint8_t out[REV_FRAME_SIZE], uint32_t counter,
+/** Write a STATUS_FRAME_SIZE status frame into out. */
+void pose_rx_build_status(uint8_t out[STATUS_FRAME_SIZE], uint32_t counter,
                           uint32_t now_ms);
+
+/** If a valid pose arrived since the last call, write an ECHO_FRAME_SIZE
+ *  echo of the latest one into out and return 1; otherwise return 0. The
+ *  laptop times this to measure the full round trip through the STM32. */
+int pose_rx_take_echo(uint8_t out[ECHO_FRAME_SIZE]);
 
 const pose_rx_status_t *pose_rx_status(void);

@@ -2,7 +2,8 @@
  * main.c  –  STM32F405 pose receiver for the ESP32-S3 WiFi-UART bridge.
  *
  *  Forward: ESP32 ──UART RX (DMA, circular)──► parser ──► latest pose
- *  Reverse: status frame every 20 ms ──UART TX (DMA)──► ESP32 ──UDP──► laptop
+ *  Reverse: echo of each pose + a status frame every 20 ms
+ *           ──UART TX (DMA)──► ESP32 ──UDP──► laptop
  *
  * The parser re-syncs on the 0xABCD magic and checks each frame's CRC.
  * If no valid pose arrives for FAILSAFE_TIMEOUT_MS, the receiver enters
@@ -21,7 +22,7 @@ static uint8_t  rx_buf[RX_BUF_SIZE];
 static uint32_t rx_tail;
 static volatile uint8_t rx_restart;
 
-static uint8_t  tx_frame[REV_FRAME_SIZE];
+static uint8_t  tx_frame[STATUS_FRAME_SIZE];   /* >= ECHO_FRAME_SIZE */
 static uint32_t tx_counter;
 
 static void Error_Handler(void)
@@ -164,8 +165,17 @@ static void rx_poll(uint32_t now)
 static void status_send(uint32_t now)
 {
     pose_rx_build_status(tx_frame, tx_counter, now);
-    if (HAL_UART_Transmit_DMA(&huart_bridge, tx_frame, REV_FRAME_SIZE) == HAL_OK)
+    if (HAL_UART_Transmit_DMA(&huart_bridge, tx_frame, STATUS_FRAME_SIZE) == HAL_OK)
         tx_counter++;
+}
+
+/* Echo the newest pose back right away so the laptop can time the full path.
+ * Only the latest pose is echoed; if several arrived in one poll the older
+ * ones are skipped. */
+static int echo_send(void)
+{
+    if (!pose_rx_take_echo(tx_frame)) return 0;
+    return HAL_UART_Transmit_DMA(&huart_bridge, tx_frame, ECHO_FRAME_SIZE) == HAL_OK;
 }
 
 /* ── LED ────────────────────────────────────────────────────────────────── */
@@ -215,11 +225,13 @@ int main(void)
         rx_poll(now);
         int failsafe = pose_rx_tick(now);
 
-        /* Skip a slot rather than queue if the previous frame is still going. */
-        if ((int32_t)(now - next_status) >= 0) {
-            next_status = now + STATUS_PERIOD_MS;
-            if (huart_bridge.gState == HAL_UART_STATE_READY)
+        /* One frame on the TX line at a time. An echo goes first; a due
+         * status frame waits for the next free slot. */
+        if (huart_bridge.gState == HAL_UART_STATE_READY) {
+            if (!echo_send() && (int32_t)(now - next_status) >= 0) {
+                next_status = now + STATUS_PERIOD_MS;
                 status_send(now);
+            }
         }
 
         led_update(now, failsafe);

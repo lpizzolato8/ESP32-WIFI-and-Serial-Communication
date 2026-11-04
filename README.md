@@ -106,12 +106,43 @@ Defined in `pose_frame.py`. The ESP32 forwards all 21 bytes verbatim.
 | 19     | 2    | crc16  | uint16 | CRC-16/CCITT-FALSE over bytes [0..18] |
 | **21** |      |        |        |                                       |
 
-### Reverse frame (laptop → ESP32 → UDP) — 1034 bytes
+### Frames from the UART side (UART → ESP32 → UDP)
 
-Defined in `test_bridge.py` (`make_reverse_frame`).
+The ESP32 finds frames in the UART RX stream by their 4-byte magic and sends
+each one, whole, as one UDP datagram to the laptop on port 4445. It doesn't
+check CRCs; the laptop does. Three frame types are relayed:
+
+| Magic     | Size | Sent by          | Contents                                   |
+|-----------|------|------------------|--------------------------------------------|
+| `REV\xAA` | 1034 | laptop via CP2102 | counter + 1024 B test payload (load test) |
+| `STM\xAA` | 67   | STM32            | counter + 57 B status block                |
+| `ECH\xAA` | 27   | STM32            | echo of the pose just received             |
+
+**REV frame — 1034 bytes** (`make_reverse_frame` in `test_bridge.py`):
 
 | Offset  | Size | Field   | Type   | Encoding                               |
 |---------|------|---------|--------|----------------------------------------|
+| 0       | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
+| 4       | 4    | counter | uint32 | little-endian, increments each frame   |
+| 8       | 1024 | payload | bytes  | counter repeated as uint32 LE (test pattern) |
+| 1032    | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..1031] |
+| **1034**|     |         |        |                                        |
+
+**STM frame — 67 bytes**: `STM\xAA`, 4-byte counter, the 57-byte status block
+(`pose_rx_status_t` in `stm32/src/pose_rx.h`), CRC-16 over the first 65 bytes.
+
+**ECH frame — 27 bytes**: `ECH\xAA`, the 21-byte pose frame exactly as
+received, CRC-16 over the first 25 bytes. The laptop matches it to a send by
+the sequence number in `pos_x`.
+
+The STM and ECH frames are kept short on purpose: they share the STM32's UART
+TX line, and a 1034-byte frame would hold it for 11.2 ms (56% of the time),
+which would swamp the echo timing. A status frame can delay an echo by at most
+0.7 ms.
+
+Bad frames increment `rev_crc_fail` rather than `rev_recv`.
+
+---------|------|---------|--------|----------------------------------------|
 | 0       | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
 | 4       | 4    | counter | uint32 | little-endian, increments each frame   |
 | 8       | 1024 | payload | bytes  | counter repeated as uint32 LE (test pattern) |
@@ -321,17 +352,18 @@ of the CP2102. It:
 - receives pose frames with circular DMA, re-syncs on `0xABCD` and checks the CRC
 - enters **failsafe** if no valid pose arrives for 100 ms (where a flight
   controller would hold position or land)
-- sends a 1034-byte reverse frame every 20 ms whose payload starts with a
-  status block (`STM1`, frames OK, CRC failures, bytes skipped, UART errors,
-  failsafe state and count, last pose), so the laptop can see what the STM32
-  actually received
+- echoes every pose it validates back to the laptop in a 27-byte `ECH` frame,
+  so the laptop can time the full round trip through the STM32
+- sends a 67-byte `STM` status frame every 20 ms (frames OK, CRC failures,
+  bytes skipped, UART errors, failsafe state and count, last pose), so the
+  laptop can see what the STM32 actually received
 
 ### Wiring
 
 | ESP32 pin | STM32 (default: USART1) | Purpose                         |
 |-----------|-------------------------|---------------------------------|
 | GPIO17    | PA10 (RX1)              | Pose frames, ESP32 → STM32      |
-| GPIO18    | PA9 (TX1)               | Status frames, STM32 → ESP32    |
+| GPIO18    | PA9 (TX1)               | Echo + status frames, STM32 → ESP32 |
 | GND       | GND                     | Common ground                   |
 
 Leaving the CP2102 RX also on GPIO17 (one TX can drive both) keeps the
@@ -346,7 +378,8 @@ git submodule update --init --depth 1     # ST HAL + CMSIS, first time only
 cmake -S stm32 -B stm32/build -G Ninja
 cmake --build stm32/build
 
-# Hold BOOT while plugging in USB (ROM DFU bootloader, 0483:df11), then:
+# Enter the ROM DFU bootloader (0483:df11): hold BOOT (BOOT0), tap NRST, or
+# hold BOOT while plugging in USB. Then:
 cmake --build stm32/build --target flash
 ```
 
@@ -361,9 +394,65 @@ python3 -m pytest stm32/test                      # parser tests, no hardware
 python3 test_bridge.py --stm32 --port /dev/ttyUSB0   # or --port none
 ```
 
-With `--stm32` the laptop doesn't send reverse frames; it reads the STM32's
-status frames and prints how many poses the STM32 validated, its CRC and UART
-errors, and any failsafe dropouts during the run.
+With `--stm32` the laptop doesn't send reverse frames. It reads the STM32's
+echo and status frames and prints:
+
+- the **round trip through the STM32** (send → echo back), as avg / p50 / p95 /
+  p99 / max, with an estimated one-way time (RTT / 2, assuming a symmetric path)
+- how many poses the STM32 validated, its CRC and UART errors, and any failsafe
+  dropouts during the run
+
+`--csv latency.csv` saves per-frame `serial_latency_ms` and `echo_rtt_ms`. The
+STM32 echoes only the newest pose each time it polls, so a burst of poses can
+produce fewer echoes than poses.
+
+Measured on the bench (WeAct STM32F405 core board, 15000 frames at 250 Hz,
+60 s, `--stm32 --port none`):
+
+```
+── Round trip via STM32 (echo) ────────────────
+  echoes received : 14867 / 15000
+  rtt avg         : 9.95ms
+  rtt min / p50   : 4.07ms / 7.45ms
+  rtt p95 / p99   : 24.26ms / 41.64ms
+  rtt max         : 114.18ms
+  est. one-way    : 4.97ms  (rtt / 2, assumes a symmetric path)
+
+── STM32 receiver ─────────────────────────────
+  poses validated : 14867 / 15000
+  CRC failures    : 0
+  bytes skipped   : 0  (re-sync)
+  UART errors     : 0
+  failsafe drops  : 0  (gaps > 100 ms during the run)
+  last pose seq   : 14999  (expected 14999)
+  rev CRC failures: 0
+```
+
+Frames that don't arrive are lost over WiFi before the ESP32 (acks lost =
+poses lost), and the loss varies between runs (0.01% to 1.2% in runs on the
+same bench). Slow echoes come in bursts of ~7 frames about every 0.3 s, which
+looks like WiFi retransmission or power save rather than the wired path (the
+ESP32 and STM32 report no overflows or errors). That is a hypothesis, not yet
+tested.
+
+### ESP32 reverse-path diagnostics
+
+The ESP32 logs a line every 5 s once a client is known:
+
+```
+rev: rx=… skipped=… sent=… sendfail=… reads=… maxburst=… | uart ovf=… buffull=… frame=… parity=… brk=…
+```
+
+`ovf` counts UART FIFO overflows (bytes lost before the driver could read
+them), `skipped` counts bytes discarded while re-syncing, and `sendfail` counts
+failed UDP sends (these rise after the laptop leaves the hotspot).
+
+The UART driver is installed from a task pinned to core 1 with the ISR in IRAM
+(`CONFIG_UART_ISR_IN_IRAM`), because on core 0 the WiFi driver delayed the
+UART interrupt long enough to overflow the 128-byte FIFO (~1.4 ms at 921600
+baud). That showed up as about 3 overflows per second and ~15% of status frames
+lost or corrupted; it is 0 now. The RX path also drains the UART while no
+client is known, so the STM32's stream can't pile up before the first packet.
 
 ---
 
@@ -389,7 +478,8 @@ errors, and any failsafe dropouts during the run.
 | --count     | 250          | Number of forward frames to send   |
 | --rev-hz    | 50           | Reverse send rate                  |
 | --rev-port  | 4445         | UDP port to receive reverse frames |
-| --stm32     | off          | Read STM32 status frames instead of sending reverse frames |
+| --stm32     | off          | Read STM32 echo + status frames instead of sending reverse frames |
+| --csv       | none         | Write per-frame latencies to this CSV file |
 
 ### main/wifi_ap.c
 
@@ -404,8 +494,15 @@ errors, and any failsafe dropouts during the run.
 
 ## Latency targets for drone control
 
-| Control loop           | Acceptable | Achieved (forward path)      |
-|------------------------|------------|------------------------------|
-| Position / velocity    | < 50 ms    | avg ~4.7 ms                  |
-| Pilot command input    | < 20 ms    | avg ~4.7 ms, p95 ~10 ms      |
-| Attitude stabilisation | < 10 ms    | baseline ~3 ms, spikes ~20 ms|
+| Control loop           | Acceptable | Measured                                      |
+|------------------------|------------|-----------------------------------------------|
+| Position / velocity    | < 50 ms    | RTT p99 ~42 ms; est. one-way avg ~5 ms        |
+| Pilot command input    | < 20 ms    | RTT p50 ~7.5 ms, p95 ~24 ms (est. one-way ~3.7 / ~12 ms) |
+| Attitude stabilisation | < 10 ms    | RTT p50 ~7.5 ms, but ~8% of echoes take > 20 ms |
+
+RTT is laptop → WiFi → ESP32 → UART → STM32 → UART → ESP32 → WiFi → laptop.
+The one-way figures are RTT / 2 and assume a symmetric path.
+
+Earlier one-way measurements through the CP2102 (laptop serial port, 250 frames,
+before sequence-number matching): avg 4.66 ms, p95 10.17 ms. Those were from a
+single second of data and are not repeated here.

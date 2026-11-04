@@ -1,6 +1,11 @@
 NEXT STEPS - ESP32-S3 WiFi-UART bridge + STM32F405 receiver
 ============================================================
-Updated 2026-10-06. Nothing below has been run on hardware yet.
+Updated 2026-11-03.
+Done on hardware (WeAct STM32F405 core board + ESP32-S3): STM32 flashed over
+USB DFU, ESP32 reverse-path UART overflow fixed, STM32 echo path added, 60 s /
+15000-frame runs at 250 Hz (README has the numbers). Not done: the Stage 1
+CP2102 run (CP2102 not connected), the GPIO17 wire-pull failsafe test, and
+the reconnect check.
 
 STAGE 1: ESP32 + CP2102 only (verify the Sep 25 fixes)
 ------------------------------------------------------
@@ -35,16 +40,16 @@ STAGE 2: STM32F405 on the ESP32 UART
 
 IDEAS, roughly by payoff
 ------------------------
-1. True end-to-end latency through the STM32
-   - Status frames carry the last pose, but go out every 20 ms, so they
-     can't time a single frame. Add a small "echo" reply sent as soon as a
-     pose arrives (needs a short reverse frame type on the ESP32 side).
+1. (done) True end-to-end latency through the STM32
+   - The STM32 echoes each validated pose in a 27-byte ECH frame; see README.
 
 2. Find the cause of the ~20 ms latency spikes
    - The ack timing separates WiFi time from ESP32 + UART + USB time.
    - If it's WiFi: esp_wifi_set_ps(WIFI_PS_NONE) on the ESP32,
      iw dev wlan0 set power_save off on the laptop, try a quieter channel.
    - Goal: < 10 ms for attitude stabilisation. Record before/after.
+   - Measured so far: echo RTT p50 7.5 ms, p95 24 ms, slow echoes in bursts of
+     ~7 frames about every 0.3 s. Not yet tested whether power save is the cause.
 
 3. Long test run + latency histogram
    - 5-10 minutes instead of 250 frames; save per-frame latencies to CSV

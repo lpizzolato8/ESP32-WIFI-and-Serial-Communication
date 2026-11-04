@@ -10,9 +10,10 @@ All four paths run simultaneously in separate threads.
 Usage:
     python3 test_bridge.py --port /dev/ttyUSB0 --baud 921600
 
-    # STM32 on the ESP32's UART: the STM32 sends the reverse (status) frames.
-    # Keep the CP2102 RX on ESP32 GPIO17 for forward latency, or --port none.
-    python3 test_bridge.py --stm32 --port /dev/ttyUSB0
+    # STM32 on the ESP32's UART: the STM32 echoes every pose and sends status
+    # frames. Reports the round trip through the STM32. Keep the CP2102 RX on
+    # ESP32 GPIO17 for forward latency too, or use --port none.
+    python3 test_bridge.py --stm32 --port none --csv latency.csv
 
 Dependencies:
     pip install pyserial
@@ -64,8 +65,15 @@ def _crc16(data: bytes) -> int:
         crc &= 0xFFFF
     return crc
 
-# STM32 status at the start of the reverse payload (stm32/src/pose_rx.h)
+# Frames from the STM32 (stm32/src/pose_rx.h):
+#   status "STM\xAA" | 4 counter | 57 status | 2 CRC = 67 B
+#   echo   "ECH\xAA" | 21 pose frame          | 2 CRC = 27 B
+_STM_MAGIC      = b"STM\xAA"
+_ECH_MAGIC      = b"ECH\xAA"
 STM_STATUS_FMT  = "<4s6IB3xI21s"
+STM_STATUS_SIZE = struct.calcsize(STM_STATUS_FMT)          # 57
+STM_FRAME_SIZE  = 4 + 4 + STM_STATUS_SIZE + 2              # 67
+ECHO_FRAME_SIZE = 4 + FRAME_SIZE + 2                       # 27
 STM_STATUS_KEYS = ("tag uptime_ms frames_ok crc_fail bytes_skipped uart_errors "
                    "failsafe_count failsafe last_rx_age_ms last_pose").split()
 
@@ -156,31 +164,55 @@ def serial_sender(ser, stop_event: threading.Event, hz: float, counters: dict):
 # ── Reverse UDP receiver (ESP32 → WiFi/UDP → Laptop) ────────────────────────
 
 def udp_receiver(sock: socket.socket, stop_event: threading.Event, counters: dict,
-                 stm: dict):
+                 stm: dict, echo_times: dict):
     sock.settimeout(0.1)
     while not stop_event.is_set():
         try:
             # Each recvfrom() returns exactly one datagram = one complete frame.
             data, _ = sock.recvfrom(2048)
-            if len(data) < REV_FRAME_SIZE or data[:4] != _REV_MAGIC:
-                continue
-            body, recv_crc = data[:REV_FRAME_SIZE - 2], struct.unpack("<H", data[REV_FRAME_SIZE - 2:REV_FRAME_SIZE])[0]
-            if _crc16(body) == recv_crc:
-                counter_val = struct.unpack("<I", data[4:8])[0]
-                counters["rev_recv"] += 1
-                status = parse_stm_status(data[8:8 + REV_PAYLOAD_SIZE])
-                if status is None:
-                    print(f"[rev-udp] frame {counter_val:>6}  {REV_FRAME_SIZE}B  CRC OK")
+            t_recv = time.perf_counter()
+            magic = data[:4]
+
+            if magic == _ECH_MAGIC and len(data) == ECHO_FRAME_SIZE:
+                if _crc16(data[:-2]) != struct.unpack("<H", data[-2:])[0]:
+                    counters["rev_crc_fail"] += 1
                     continue
-                stm.setdefault("first", (counter_val, status))
-                stm["last"] = (counter_val, status)
-                if counter_val % 25 == 0:
-                    print(f"[stm32]   status {counter_val:>6}  ok={status['frames_ok']}  "
-                          f"crc_fail={status['crc_fail']}  failsafe={status['failsafe']}")
+                try:
+                    seq = frame_seq(PoseFrame.unpack(data[4:4 + FRAME_SIZE]))
+                except ValueError:
+                    counters["rev_crc_fail"] += 1
+                    continue
+                echo_times.setdefault(seq, t_recv)
+                continue
+
+            if magic == _STM_MAGIC and len(data) == STM_FRAME_SIZE:
+                size, off = STM_FRAME_SIZE, 8
+            elif magic == _REV_MAGIC and len(data) == REV_FRAME_SIZE:
+                size, off = REV_FRAME_SIZE, 8
             else:
+                continue
+
+            body, recv_crc = data[:size - 2], struct.unpack("<H", data[size - 2:])[0]
+            if _crc16(body) != recv_crc:
                 counters["rev_crc_fail"] += 1
+                continue
+            counter_val = struct.unpack("<I", data[4:8])[0]
+            counters["rev_recv"] += 1
+            status = parse_stm_status(data[off:off + REV_PAYLOAD_SIZE])
+            if status is None:
+                print(f"[rev-udp] frame {counter_val:>6}  {REV_FRAME_SIZE}B  CRC OK")
+                continue
+            stm.setdefault("first", (counter_val, status))
+            stm["last"] = (counter_val, status)
+            if counter_val % 25 == 0:
+                print(f"[stm32]   status {counter_val:>6}  ok={status['frames_ok']}  "
+                      f"crc_fail={status['crc_fail']}  failsafe={status['failsafe']}")
         except socket.timeout:
             pass
+
+
+def percentile(sorted_vals, p):
+    return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * p / 100))]
 
 
 # ── STM32 summary ─────────────────────────────────────────────────────────────
@@ -221,6 +253,8 @@ def main():
     parser.add_argument("--rev-hz",     default=REVERSE_HZ, type=float, help="Reverse send rate in Hz")
     parser.add_argument("--rev-port",   default=REVERSE_UDP_PORT, type=int,
                         help="Laptop UDP port for reverse data (default 4445)")
+    parser.add_argument("--csv",        default=None,
+                        help="Write per-frame latencies (serial and echo) to this CSV file")
     parser.add_argument("--stm32",      action="store_true",
                         help="STM32 is on the UART: read its status frames "
                              "instead of sending reverse frames")
@@ -258,7 +292,7 @@ def main():
 
     print(f"[run]    {args.count} frames @ {args.hz:.0f} Hz  (frame={FRAME_SIZE}B)")
     if args.stm32:
-        print("[run]    reverse channel: STM32 status frames\n")
+        print("[run]    reverse channel: STM32 echo + status frames\n")
     else:
         print(f"[run]    reverse channel @ {args.rev_hz:.0f} Hz\n")
 
@@ -268,6 +302,7 @@ def main():
     stop_event  = threading.Event()
     counters    = {"raw_bytes": 0, "crc_fail": 0, "rev_sent": 0, "rev_recv": 0, "rev_crc_fail": 0}
     stm         = {}   # "first" / "last": (counter, status) from STM32 frames
+    echo_times  = {}   # seq → time the STM32's echo of that pose arrived
 
     # Thread 1: serial RX  (ESP32 → UART → Laptop)
     rx_thread = threading.Thread(target=serial_receiver,
@@ -279,7 +314,7 @@ def main():
                                      daemon=True)
     # Thread 3: UDP RX     (ESP32 → WiFi/UDP → Laptop)
     rx_rev_thread = threading.Thread(target=udp_receiver,
-                                     args=(udp_rx, stop_event, counters, stm),
+                                     args=(udp_rx, stop_event, counters, stm, echo_times),
                                      daemon=True)
 
     # Thread 4: UDP ack RX (ESP32 → WiFi/UDP → Laptop)
@@ -310,6 +345,7 @@ def main():
         time.sleep(0.05)
         stm["base"] = stm["last"]
         ack_times.clear()
+        echo_times.clear()
         print(f"[stm32]  baseline: ok={stm['base'][1]['frames_ok']}\n")
 
     # ── Forward send loop (Laptop → WiFi → ESP32) ───────────────────────────
@@ -372,6 +408,26 @@ def main():
         print("  some acks lost; skipping rtt (acks are paired by order)")
 
     if args.stm32:
+        echo_rtts = {seq: (t - send_times[seq]) * 1000
+                     for seq, t in echo_times.items() if 0 <= seq < len(send_times)}
+        print(f"\n── Round trip via STM32 (echo) {'─'*16}")
+        print(f"  echoes received : {len(echo_rtts)} / {args.count}"
+              f"  (STM32 echoes only the newest pose per poll)")
+        if echo_rtts:
+            v = sorted(echo_rtts.values())
+            print(f"  rtt avg         : {sum(v) / len(v):.2f}ms")
+            print(f"  rtt min / p50   : {v[0]:.2f}ms / {percentile(v, 50):.2f}ms")
+            print(f"  rtt p95 / p99   : {percentile(v, 95):.2f}ms / {percentile(v, 99):.2f}ms")
+            print(f"  rtt max         : {v[-1]:.2f}ms")
+            print(f"  est. one-way    : {sum(v) / len(v) / 2:.2f}ms  (rtt / 2, assumes a symmetric path)")
+        if args.csv:
+            with open(args.csv, "w") as f:
+                f.write("seq,serial_latency_ms,echo_rtt_ms\n")
+                for seq in range(args.count):
+                    ser_ms = (received[seq] - send_times[seq]) * 1000 if seq in received else ""
+                    echo_ms = echo_rtts.get(seq, "")
+                    f.write(f"{seq},{ser_ms},{echo_ms}\n")
+            print(f"  per-frame data  : {args.csv}")
         print_stm32_summary(stm, counters, args.count)
         udp_tx.close()
         udp_rx.close()

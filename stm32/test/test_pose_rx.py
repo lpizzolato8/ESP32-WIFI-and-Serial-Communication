@@ -14,8 +14,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 from pose_frame import PoseFrame, FRAME_SIZE, POS_SCALE, crc16_ccitt  # noqa: E402
 
-REV_FRAME_SIZE = 1034
 STATUS_FMT = "<4s6IB3xI21s"
+STATUS_FRAME_SIZE = 4 + 4 + struct.calcsize(STATUS_FMT) + 2   # 67
+ECHO_FRAME_SIZE = 4 + FRAME_SIZE + 2                           # 27
 
 
 @pytest.fixture
@@ -30,6 +31,8 @@ def rx(tmp_path):
     lib.pose_rx_feed.argtypes = [ctypes.c_uint8, ctypes.c_uint32]
     lib.pose_rx_tick.argtypes = [ctypes.c_uint32]
     lib.pose_rx_build_status.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
+    lib.pose_rx_take_echo.argtypes = [ctypes.c_char_p]
+    lib.pose_rx_take_echo.restype = ctypes.c_int
     return lib
 
 
@@ -39,12 +42,12 @@ def feed(lib, data: bytes, now: int = 0):
 
 
 def status(lib, now: int = 0, counter: int = 0) -> dict:
-    buf = ctypes.create_string_buffer(REV_FRAME_SIZE)
+    buf = ctypes.create_string_buffer(STATUS_FRAME_SIZE)
     lib.pose_rx_build_status(buf, counter, now)
     raw = buf.raw
-    assert raw[:4] == b"REV\xAA"
+    assert raw[:4] == b"STM\xAA"
     assert struct.unpack_from("<I", raw, 4)[0] == counter
-    assert struct.unpack_from("<H", raw, REV_FRAME_SIZE - 2)[0] == crc16_ccitt(raw[:-2])
+    assert struct.unpack_from("<H", raw, STATUS_FRAME_SIZE - 2)[0] == crc16_ccitt(raw[:-2])
     fields = struct.unpack_from(STATUS_FMT, raw, 8)
     keys = ("tag uptime_ms frames_ok crc_fail bytes_skipped uart_errors "
             "failsafe_count failsafe last_rx_age_ms last_pose").split()
@@ -118,8 +121,37 @@ def test_failsafe(rx):
     assert status(rx)["failsafe_count"] == 2
 
 
-def test_status_payload_is_zero_padded(rx):
-    buf = ctypes.create_string_buffer(REV_FRAME_SIZE)
+def test_status_frame_size(rx):
+    assert STATUS_FRAME_SIZE == 67
+    buf = ctypes.create_string_buffer(STATUS_FRAME_SIZE)
     rx.pose_rx_build_status(buf, 7, 0)
-    payload = buf.raw[8:8 + 1024]
-    assert payload[struct.calcsize(STATUS_FMT):] == bytes(1024 - struct.calcsize(STATUS_FMT))
+    assert len(buf.raw) == STATUS_FRAME_SIZE
+
+
+def take_echo(lib):
+    buf = ctypes.create_string_buffer(ECHO_FRAME_SIZE)
+    return buf.raw if lib.pose_rx_take_echo(buf) else None
+
+
+def test_echo_carries_the_pose_and_a_valid_crc(rx):
+    assert ECHO_FRAME_SIZE == 27
+    assert take_echo(rx) is None                      # nothing received yet
+    feed(rx, frame(42))
+    e = take_echo(rx)
+    assert e[:4] == b"ECH\xAA"
+    assert e[4:4 + FRAME_SIZE] == frame(42)
+    assert struct.unpack_from("<H", e, ECHO_FRAME_SIZE - 2)[0] == crc16_ccitt(e[:-2])
+    assert take_echo(rx) is None                      # one echo per new pose
+
+
+def test_echo_is_the_newest_pose(rx):
+    feed(rx, frame(1) + frame(2) + frame(3))
+    assert take_echo(rx)[4:4 + FRAME_SIZE] == frame(3)
+    assert take_echo(rx) is None
+
+
+def test_corrupt_frame_is_not_echoed(rx):
+    bad = bytearray(frame(1))
+    bad[7] ^= 0x01
+    feed(rx, bytes(bad))
+    assert take_echo(rx) is None

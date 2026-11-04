@@ -6,6 +6,7 @@ static uint32_t acc_len;
 
 static pose_rx_status_t st;
 static uint8_t  have_pose;
+static uint8_t  echo_pending;
 static uint32_t last_pose_ms;
 
 static void on_pose(const pose_frame_t *f, uint32_t now_ms)
@@ -14,6 +15,7 @@ static void on_pose(const pose_frame_t *f, uint32_t now_ms)
     memcpy(&st.last_pose, f, sizeof *f);
     st.frames_ok++;
     have_pose    = 1;
+    echo_pending = 1;
     last_pose_ms = now_ms;
 }
 
@@ -74,7 +76,7 @@ int pose_rx_tick(uint32_t now_ms)
     return fs;
 }
 
-void pose_rx_build_status(uint8_t out[REV_FRAME_SIZE], uint32_t counter,
+void pose_rx_build_status(uint8_t out[STATUS_FRAME_SIZE], uint32_t counter,
                           uint32_t now_ms)
 {
     memcpy(st.tag, "STM1", 4);
@@ -82,12 +84,23 @@ void pose_rx_build_status(uint8_t out[REV_FRAME_SIZE], uint32_t counter,
     st.last_rx_age_ms = have_pose ? now_ms - last_pose_ms : 0xFFFFFFFFu;
 
     uint8_t *p = out;
-    memcpy(p, "REV\xAA", 4);        p += 4;
+    memcpy(p, "STM\xAA", 4);       p += 4;
     memcpy(p, &counter, 4);         p += 4;
-    memset(p, 0, REV_PAYLOAD_SIZE);
-    memcpy(p, &st, sizeof st);      p += REV_PAYLOAD_SIZE;
+    memcpy(p, &st, sizeof st);      p += sizeof st;
     uint16_t crc = crc16_ccitt(out, (uint16_t)(p - out));
     memcpy(p, &crc, 2);
+}
+
+int pose_rx_take_echo(uint8_t out[ECHO_FRAME_SIZE])
+{
+    if (!echo_pending) return 0;
+    echo_pending = 0;
+
+    memcpy(out, "ECH\xAA", 4);
+    memcpy(out + 4, &st.last_pose, FRAME_SIZE);
+    uint16_t crc = crc16_ccitt(out, 4 + FRAME_SIZE);
+    memcpy(out + 4 + FRAME_SIZE, &crc, 2);
+    return 1;
 }
 
 const pose_rx_status_t *pose_rx_status(void)
