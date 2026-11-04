@@ -1,8 +1,28 @@
-# ESP32-S3-N16R8 WiFi-UART Bridge
+# ESP32-S3 WiFi-UART Bridge
 
-A complete ESP-IDF project that turns the ESP32-S3-N16R8 into a WiFi hotspot
-with a **bidirectional** bridge between WiFi and UART — designed to bridge a
-Linux laptop to an STM32 microcontroller wirelessly.
+An ESP-IDF project that turns an ESP32-S3 into a WiFi hotspot with a
+**bidirectional** UDP <-> UART bridge, built to carry pose data from a Linux
+laptop to an STM32F405 flight-controller MCU without a cable. Includes the STM32
+receiver firmware (DMA, CRC re-sync, failsafe) and a Python test harness that
+measures loss and round-trip latency.
+
+**Measured** (60 s, 15,000 pose frames at 250 Hz, laptop to STM32 and back):
+every frame the ESP32 received was validated by the STM32 with 0 CRC and 0 UART
+errors, and the median round trip through the STM32 was 7.5 ms
+(p95 24 ms). WiFi loss on the uplink was 0.01-1.2% depending on the run.
+Details in [Latency targets](#latency-targets-for-drone-control).
+
+**Contents:**
+[How it works](#how-it-works) ·
+[Hardware](#hardware) ·
+[Network settings](#network-settings) ·
+[Frame formats](#frame-formats) ·
+[Project layout](#project-layout) ·
+[Build and flash](#build-and-flash) ·
+[Testing](#testing) ·
+[STM32F405 receiver](#stm32f405-receiver) ·
+[Tunable parameters](#tunable-parameters) ·
+[Latency targets](#latency-targets-for-drone-control)
 
 ---
 
@@ -121,68 +141,30 @@ check CRCs; the laptop does. Three frame types are relayed:
 **REV frame — 1034 bytes** (`make_reverse_frame` in `test_bridge.py`):
 
 | Offset  | Size | Field   | Type   | Encoding                               |
-|---------|------|---------|--------|----------------------------------------|
-| 0       | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
-| 4       | 4    | counter | uint32 | little-endian, increments each frame   |
-| 8       | 1024 | payload | bytes  | counter repeated as uint32 LE (test pattern) |
-| 1032    | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..1031] |
-| **1034**|     |         |        |                                        |
-
-**STM frame — 67 bytes**: `STM\xAA`, 4-byte counter, the 57-byte status block
-(`pose_rx_status_t` in `stm32/src/pose_rx.h`), CRC-16 over the first 65 bytes.
-
-**ECH frame — 27 bytes**: `ECH\xAA`, the 21-byte pose frame exactly as
-received, CRC-16 over the first 25 bytes. The laptop matches it to a send by
-the sequence number in `pos_x`.
-
-The STM and ECH frames are kept short on purpose: they share the STM32's UART
-TX line, and a 1034-byte frame would hold it for 11.2 ms (56% of the time),
-which would swamp the echo timing. A status frame can delay an echo by at most
-0.7 ms.
-
-Bad frames increment `rev_crc_fail` rather than `rev_recv`.
-
----------|------|---------|--------|----------------------------------------|
-| 0       | 4    | magic   | bytes  | `REV\xAA` — frame sync                |
-| 4       | 4    | counter | uint32 | little-endian, increments each frame   |
-| 8       | 1024 | payload | bytes  | counter repeated as uint32 LE (test pattern) |
-| 1032    | 2    | crc16   | uint16 | CRC-16/CCITT-FALSE over bytes [0..1031] |
-| **1034**|     |         |        |                                        |
-
-The receiver searches for the magic bytes and validates the CRC on every frame.
-Bad frames increment `rev_crc_fail` rather than `rev_recv`.
-
----
+|---
 
 ## Project layout
 
 ```
-ESP32Communication/
+.
 ├── CMakeLists.txt           # Top-level ESP-IDF project file
-├── sdkconfig.defaults       # Target + 16 MB flash size
+├── sdkconfig.defaults       # Target, 16 MB flash, UART ISR in IRAM
+├── main/                    # ESP32-S3 firmware (ESP-IDF)
+│   ├── main.c               # app_main boot sequence
+│   ├── wifi_ap.c/.h         # Soft-AP initialisation
+│   ├── udp_uart_bridge.c/.h # Bidirectional UDP <-> UART bridge (tasks, diagnostics)
+│   └── pose_frame.h         # 21-byte pose frame struct + CRC (shared with the STM32)
+├── stm32/                   # STM32F405 receiver firmware (CMake + HAL)
+│   ├── src/                 # board.h, main.c, pose_rx.c/.h, interrupt handlers
+│   ├── test/                # Host tests for pose_rx.c (pytest)
+│   ├── lib/                 # ST HAL + CMSIS (git submodules)
+│   ├── cmake/               # arm-none-eabi toolchain file
+│   └── STM32F405RG.ld       # Linker script
 ├── pose_frame.py            # Python frame pack/unpack with CRC
-├── test_bridge.py           # Bidirectional bridge test (4 threads)
+├── test_bridge.py           # Bridge tester: latency, loss, STM32 echo round trip
 ├── read_serial.py           # Serial monitor with magic re-sync
 ├── test_send.py             # Minimal send-only test (no serial)
-├── stm32/                   # STM32F405 receiver firmware (CMake + HAL)
-│   ├── CMakeLists.txt
-│   ├── STM32F405RG.ld       # Linker script
-│   ├── cmake/               # arm-none-eabi toolchain file
-│   ├── lib/                 # ST HAL + CMSIS (git submodules)
-│   ├── src/
-│   │   ├── board.h          # UART pins, clock source, LED — edit for your board
-│   │   ├── main.c           # Clock, UART DMA, main loop
-│   │   ├── pose_rx.c/.h     # Frame parser, failsafe, status frame (no HAL)
-│   │   └── stm32f4xx_it.c   # Interrupt handlers
-│   └── test/test_pose_rx.py # Host tests for pose_rx.c (pytest)
-└── main/
-    ├── CMakeLists.txt       # Component registration (IDF 6.1+)
-    ├── main.c               # app_main boot sequence
-    ├── wifi_ap.c            # Soft-AP initialisation
-    ├── wifi_ap.h
-    ├── udp_uart_bridge.c    # Bidirectional UDP↔UART bridge (2 tasks)
-    ├── udp_uart_bridge.h
-    └── pose_frame.h         # 21-byte frame struct + CRC for the STM32 side
+└── NEXT_STEPS.txt           # Bench checklist and open ideas
 ```
 
 ---
@@ -213,7 +195,7 @@ pip install pyserial
 ## Build and flash
 
 ```bash
-cd ~/ESP32Communication
+cd ESP32-WIFI-and-Serial-Communication
 
 # First time only
 idf.py set-target esp32s3

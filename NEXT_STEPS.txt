@@ -51,6 +51,13 @@ IDEAS, roughly by payoff
    - Measured so far: echo RTT p50 7.5 ms, p95 24 ms, slow echoes in bursts of
      ~7 frames about every 0.3 s. Not yet tested whether power save is the cause.
 
+2b. Attribute the latency tail to WiFi or the wired path
+   - Give the ESP32's 1-byte ack a sequence number so acks can be matched to
+     sends even when some are lost (today they are paired by order, so the
+     WiFi round trip is skipped if any ack is missing).
+   - Optional: run the CP2102 test for a one-way figure at the ESP32's UART and
+     to check the "RTT / 2" estimate. Not needed for the echo numbers.
+
 3. Long test run + latency histogram
    - 5-10 minutes instead of 250 frames; save per-frame latencies to CSV
      and plot percentiles. Good for a resume or interview.
